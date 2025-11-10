@@ -1,0 +1,66 @@
+name: Deploy to Server on Develop Push
+
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create deployment archive
+        run: |
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          archive_name="tala-bot-${timestamp}.tar.gz"
+          tar -czf "$archive_name" \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=data \
+            --exclude=sessions \
+            --exclude=ssh-mcp \
+            --exclude="*.tar.gz" \
+            .
+          echo "ARCHIVE_NAME=$archive_name" >> $GITHUB_ENV
+
+      - name: Copy archive to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "${{ env.ARCHIVE_NAME }}"
+          target: "/tmp/"
+
+      - name: Deploy and restart on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            ARCHIVE_NAME="${{ env.ARCHIVE_NAME }}"
+            
+            mkdir -p "$DEPLOY_PATH"
+            tar -xzf "/tmp/$ARCHIVE_NAME" -C "$DEPLOY_PATH" --strip-components=1
+            
+            if [ -f "$DEPLOY_PATH/.env.example" ] || [ -f "$DEPLOY_PATH/.env" ]; then
+              if [ -f "$DEPLOY_PATH/deployment/merge-env.sh" ]; then
+                bash "$DEPLOY_PATH/deployment/merge-env.sh" "$DEPLOY_PATH"
+              fi
+            fi
+            
+            cd "$DEPLOY_PATH/deployment"
+            docker compose up -d --build
+            
+            rm -f "/tmp/$ARCHIVE_NAME"
+            
+            echo "✅ Deployment completed successfully"
+
