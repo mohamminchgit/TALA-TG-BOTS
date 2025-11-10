@@ -16,7 +16,9 @@ jobs:
         run: |
           timestamp=$(date +%Y%m%d-%H%M%S)
           archive_name="tala-bot-${timestamp}.tar.gz"
+
           tar -czf "$archive_name" \
+            --ignore-failed-read \
             --exclude=.git \
             --exclude=.env \
             --exclude=data \
