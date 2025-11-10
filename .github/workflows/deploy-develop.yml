@@ -83,11 +83,22 @@ jobs:
             COMMIT_SUBJECT="${COMMIT_SUBJECT:-${{ steps.meta.outputs.commit_subject }}}"
             COMMIT_AUTHOR="${COMMIT_AUTHOR:-${{ steps.meta.outputs.commit_author }}}"
 
+            # sanitize to remove potential CR/LF injected via secrets
+            sanitize() {
+              printf '%s' "$1" | tr -d '\r\n'
+            }
+
+            DEPLOY_PATH="$(sanitize "$DEPLOY_PATH")"
+            ARCHIVE_NAME="$(sanitize "$ARCHIVE_NAME")"
+            COMMIT_SHA="$(sanitize "$COMMIT_SHA")"
+            COMMIT_SUBJECT="$(sanitize "$COMMIT_SUBJECT")"
+            COMMIT_AUTHOR="$(sanitize "$COMMIT_AUTHOR")"
+
             notify() {
               local status="$1"
               local details="$2"
               if command -v python3 >/dev/null 2>&1 && [ -f "$DEPLOY_PATH/scripts/admin_notify.py" ]; then
-                python3 "$DEPLOY_PATH/scripts/admin_notify.py" \
+                PYTHONPATH="$DEPLOY_PATH" python3 "$DEPLOY_PATH/scripts/admin_notify.py" \
                   --event deployment \
                   --status "$status" \
                   --commit "$COMMIT_SHA" \
