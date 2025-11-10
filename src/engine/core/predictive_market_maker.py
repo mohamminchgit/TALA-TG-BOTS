@@ -340,31 +340,12 @@ class PredictiveMarketMaker:
     def _ensure_source_expiry(self, pending: PendingPredictiveTrade) -> None:
         if pending.source_expiry_task is not None:
             return
-
-        async def _expire() -> None:
-            try:
-                await asyncio.sleep(self._source_expiry_seconds)
-            except asyncio.CancelledError:
-                raise
-            await self._cancel_pending_trade(pending, reason="timeout")
-
-        pending.source_expiry_task = asyncio.create_task(
-            _expire(),
-            name=f"pred-source-expiry-{pending.trade_id}",
-        )
+        pending.source_expiry_task = self._create_source_expiry_task(pending)
 
     async def _schedule_timeout(self, pending: PendingPredictiveTrade) -> None:
         if pending.timeout_task is not None:
             return
-
-        async def _timeout() -> None:
-            try:
-                await asyncio.sleep(self._timeout_seconds)
-            except asyncio.CancelledError:
-                raise
-            await self._cancel_pending_trade(pending, reason="timeout")
-
-        pending.timeout_task = asyncio.create_task(_timeout(), name=f"pred-timeout-{pending.trade_id}")
+        pending.timeout_task = self._create_timeout_task(pending)
 
     async def _save_state(self, pending: PendingPredictiveTrade) -> None:
         state = {
@@ -458,6 +439,26 @@ class PredictiveMarketMaker:
         for pending in candidates:
             await self._cancel_pending_trade(pending, reason=reason)
 
+    def _create_timeout_task(self, pending: PendingPredictiveTrade) -> asyncio.Task:
+        async def _timeout() -> None:
+            try:
+                await asyncio.sleep(self._timeout_seconds)
+            except asyncio.CancelledError:
+                raise
+            await self._cancel_pending_trade(pending, reason="timeout")
+
+        return asyncio.create_task(_timeout(), name=f"pred-timeout-{pending.trade_id}")
+
+    def _create_source_expiry_task(self, pending: PendingPredictiveTrade) -> asyncio.Task:
+        async def _expire() -> None:
+            try:
+                await asyncio.sleep(self._source_expiry_seconds)
+            except asyncio.CancelledError:
+                raise
+            await self._cancel_pending_trade(pending, reason="timeout")
+
+        return asyncio.create_task(_expire(), name=f"pred-source-expiry-{pending.trade_id}")
+
     def _should_post_speculative(self, direction: TradeDirection, source_price: int, target_price: int) -> bool:
         if direction == "source_sell":
             counterpart = self._order_book.best_entry("destination", "buy")
@@ -526,11 +527,27 @@ class PredictiveMarketMaker:
 
     def update_speculative_timeout(self, seconds: int) -> None:
         self._timeout_seconds = max(1, seconds)
+        for pending in list(self._pending.values()):
+            if pending.stage != "awaiting_fill":
+                continue
+            if pending.timeout_task:
+                pending.timeout_task.cancel()
+            pending.timeout_task = self._create_timeout_task(pending)
         logger.info("Updated speculative trade timeout to %s", self._timeout_seconds)
 
     def update_minimum_profit_spread(self, value: int) -> None:
         snapshot = self._policy.update(fixed_spread_delta=value)
         logger.info("Updated fixed spread delta via legacy command to %s", snapshot.fixed_spread_delta)
 
+    def update_source_expiry_seconds(self, seconds: int) -> None:
+        self._source_expiry_seconds = max(1, seconds)
+        for pending in list(self._pending.values()):
+            if pending.stage not in {"awaiting_post_ack", "awaiting_fill"}:
+                continue
+            if pending.source_expiry_task:
+                pending.source_expiry_task.cancel()
+            pending.source_expiry_task = self._create_source_expiry_task(pending)
+        logger.info("Updated source order expiry to %s seconds", self._source_expiry_seconds)
+
     def pending_trade_count(self) -> int:
-        return len(self._pending)
+        return sum(1 for trade in self._pending.values() if trade.stage != "cancelled")

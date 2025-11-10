@@ -12,6 +12,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Validate deployment secrets
+        run: |
+          missing=()
+          [ -z "${{ secrets.DEPLOY_HOST }}" ] && missing+=("DEPLOY_HOST")
+          [ -z "${{ secrets.DEPLOY_USER }}" ] && missing+=("DEPLOY_USER")
+          [ -z "${{ secrets.DEPLOY_SSH_KEY }}" ] && missing+=("DEPLOY_SSH_KEY")
+          [ -z "${{ secrets.DEPLOY_PATH }}" ] && missing+=("DEPLOY_PATH")
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "❌ Missing deployment secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
       - name: Create deployment archive
         run: |
           timestamp=$(date +%Y%m%d-%H%M%S)
@@ -28,6 +40,16 @@ jobs:
             .
           echo "ARCHIVE_NAME=$archive_name" >> $GITHUB_ENV
 
+      - name: Capture deployment metadata
+        id: meta
+        run: |
+          COMMIT_SHA="${GITHUB_SHA::7}"
+          COMMIT_SUBJECT="$(git log -1 --pretty=%s)"
+          COMMIT_AUTHOR="$(git log -1 --pretty=%an)"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "commit_subject=$COMMIT_SUBJECT" >> "$GITHUB_OUTPUT"
+          echo "commit_author=$COMMIT_AUTHOR" >> "$GITHUB_OUTPUT"
+
       - name: Copy archive to server
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -40,29 +62,64 @@ jobs:
 
       - name: Deploy and restart on server
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          ARCHIVE_NAME: ${{ env.ARCHIVE_NAME }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          COMMIT_SHA: ${{ steps.meta.outputs.commit_sha }}
+          COMMIT_SUBJECT: ${{ steps.meta.outputs.commit_subject }}
+          COMMIT_AUTHOR: ${{ steps.meta.outputs.commit_author }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: ARCHIVE_NAME,DEPLOY_PATH,COMMIT_SHA,COMMIT_SUBJECT,COMMIT_AUTHOR
+          script_stop: true
           script: |
-            set -e
-            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
-            ARCHIVE_NAME="${{ env.ARCHIVE_NAME }}"
-            
+            set -euo pipefail
+            DEPLOY_PATH="${DEPLOY_PATH:-/home/gold/my-arbitrage-bot}"
+            ARCHIVE_NAME="${ARCHIVE_NAME:-${{ env.ARCHIVE_NAME }}}"
+            COMMIT_SHA="${COMMIT_SHA:-${{ steps.meta.outputs.commit_sha }}}"
+            COMMIT_SUBJECT="${COMMIT_SUBJECT:-${{ steps.meta.outputs.commit_subject }}}"
+            COMMIT_AUTHOR="${COMMIT_AUTHOR:-${{ steps.meta.outputs.commit_author }}}"
+
+            notify() {
+              local status="$1"
+              local details="$2"
+              if command -v python3 >/dev/null 2>&1 && [ -f "$DEPLOY_PATH/scripts/admin_notify.py" ]; then
+                python3 "$DEPLOY_PATH/scripts/admin_notify.py" \
+                  --event deployment \
+                  --status "$status" \
+                  --commit "$COMMIT_SHA" \
+                  --author "$COMMIT_AUTHOR" \
+                  --summary "$COMMIT_SUBJECT" \
+                  --details "$details" || echo "⚠️  Failed to send admin notification ($status)"
+              else
+                echo "python3 unavailable; skipping admin notification ($status)"
+              fi
+            }
+
+            trap 'notify failed "Deployment failed"; exit 1' ERR
+
             mkdir -p "$DEPLOY_PATH"
             tar -xzf "/tmp/$ARCHIVE_NAME" -C "$DEPLOY_PATH" --strip-components=1
-            
+
+            cd "$DEPLOY_PATH"
+
             if [ -f "$DEPLOY_PATH/.env.example" ] || [ -f "$DEPLOY_PATH/.env" ]; then
-              if [ -f "$DEPLOY_PATH/deployment/merge-env.sh" ]; then
-                bash "$DEPLOY_PATH/deployment/merge-env.sh" "$DEPLOY_PATH"
+              if [ -f "deployment/merge-env.sh" ]; then
+                bash "deployment/merge-env.sh" "$DEPLOY_PATH"
               fi
             fi
-            
+
+            notify started "Starting docker compose rebuild"
+
             cd "$DEPLOY_PATH/deployment"
             docker compose up -d --build
-            
+
+            notify success "Deployment completed successfully"
+
             rm -f "/tmp/$ARCHIVE_NAME"
-            
+
             echo "✅ Deployment completed successfully"
 

@@ -30,6 +30,8 @@ class AdminControlBot:
         status_refresh_seconds: int,
         source_alias: str,
         destination_alias: str,
+        engine_config: Dict[str, Any],
+        initial_monitor_only: bool,
     ) -> None:
         self._redis = redis_manager
         self._api_id = api_id
@@ -47,6 +49,15 @@ class AdminControlBot:
             "base_carry_limit": policy_snapshot.base_carry_limit,
             "opportunity_carry_limit": policy_snapshot.opportunity_carry_limit,
             "auto_n_delay_seconds": max(0, initial_auto_delay),
+            "predictive_price_delta": engine_config.get("predictive_price_delta"),
+            "predictive_suffix_digits": engine_config.get("predictive_suffix_digits"),
+            "speculative_trade_timeout_seconds": engine_config.get("speculative_trade_timeout_seconds"),
+            "source_order_expiry_seconds": engine_config.get("source_order_expiry_seconds"),
+            "exit_break_even_timeout_seconds": engine_config.get("exit_break_even_timeout_seconds"),
+            "exit_stop_loss_timeout_seconds": engine_config.get("exit_stop_loss_timeout_seconds"),
+            "stop_loss_price_offset": engine_config.get("stop_loss_price_offset"),
+            "circuit_breaker_pause_seconds": engine_config.get("circuit_breaker_pause_seconds"),
+            "monitor_only": initial_monitor_only,
         }
         self._aliases = {
             "source": source_alias,
@@ -104,6 +115,42 @@ class AdminControlBot:
             value = int(data.split(":", 1)[1])
             await self._publish_update({"auto_n_delay_seconds": value})
             await event.answer(f"Auto ن delay set to {value}s")
+        elif data.startswith("predictive_delta:"):
+            value = int(data.split(":", 1)[1])
+            await self._publish_update({"predictive_price_delta": value})
+            await event.answer(f"Predictive delta set to {value}")
+        elif data.startswith("suffix:"):
+            value = int(data.split(":", 1)[1])
+            await self._publish_update({"predictive_suffix_digits": value})
+            await event.answer(f"Predictive suffix digits set to {value}")
+        elif data.startswith("spec_timeout:"):
+            value = int(data.split(":", 1)[1])
+            await self._publish_update({"speculative_trade_timeout_seconds": value})
+            await event.answer(f"Speculative timeout set to {value}s")
+        elif data.startswith("source_expiry:"):
+            value = int(data.split(":", 1)[1])
+            await self._publish_update({"source_order_expiry_seconds": value})
+            await event.answer(f"Source expiry set to {value}s")
+        elif data.startswith("break_even:"):
+            value = int(data.split(":", 1)[1])
+            await self._publish_update({"exit_break_even_timeout_seconds": value})
+            await event.answer(f"Break-even wait set to {value}s")
+        elif data.startswith("stop_loss_wait:"):
+            value = int(data.split(":", 1)[1])
+            await self._publish_update({"exit_stop_loss_timeout_seconds": value})
+            await event.answer(f"Stop-loss wait set to {value}s")
+        elif data.startswith("stop_loss_offset:"):
+            value = int(data.split(":", 1)[1])
+            await self._publish_update({"stop_loss_price_offset": value})
+            await event.answer(f"Stop-loss offset set to {value}")
+        elif data.startswith("circuit:"):
+            value = int(data.split(":", 1)[1])
+            await self._publish_update({"circuit_breaker_pause_seconds": value})
+            await event.answer(f"Circuit breaker set to {value // 60}m")
+        elif data.startswith("monitor:"):
+            enabled = data.split(":", 1)[1] == "1"
+            await self._publish_update({"monitor_only": enabled})
+            await event.answer("Monitor-only enabled" if enabled else "Monitor-only disabled")
         elif data == "command:pause":
             await self._publish_command({"command": "safe_pause"})
             await event.answer("Pause requested")
@@ -113,6 +160,12 @@ class AdminControlBot:
         elif data == "command:status":
             await self._publish_command({"command": "status"})
             await event.answer("Status requested")
+        elif data == "command:stop":
+            await self._publish_command({"command": "shutdown"})
+            await event.answer("Shutdown requested")
+        elif data == "command:start":
+            await self._publish_command({"command": "resume"})
+            await event.answer("Start requested")
         else:
             await event.answer("Unknown action", alert=True)
             return
@@ -175,16 +228,50 @@ class AdminControlBot:
 
         if event == "config_updated":
             applied = data.get("applied") or {}
-            for key in ("fixed_spread_delta", "base_carry_limit", "opportunity_carry_limit", "auto_n_delay_seconds"):
-                if key in applied:
-                    self._state[key] = applied[key]
+            tracked_keys = {
+                "fixed_spread_delta",
+                "base_carry_limit",
+                "opportunity_carry_limit",
+                "auto_n_delay_seconds",
+                "predictive_price_delta",
+                "predictive_suffix_digits",
+                "speculative_trade_timeout_seconds",
+                "source_order_expiry_seconds",
+                "exit_break_even_timeout_seconds",
+                "exit_stop_loss_timeout_seconds",
+                "stop_loss_price_offset",
+                "circuit_breaker_pause_seconds",
+                "monitor_only",
+            }
+            for key, value in applied.items():
+                if key in tracked_keys:
+                    self._state[key] = value
             await self._refresh_dashboard()
             await self._notify(f"✅ Config updated: {json.dumps(applied, ensure_ascii=False)}")
         elif event == "config_noop":
             await self._notify("⚠️ Config update ignored: no supported keys")
         elif event == "status":
             await self._render_status(data)
-        elif event in {"safe_pause_pending", "safe_pause_ready", "monitor_update", "panic", "resume", "shutdown", "admin_unknown"}:
+        elif event == "monitor_update":
+            if "monitor_only" in data:
+                self._state["monitor_only"] = bool(data["monitor_only"])
+                await self._refresh_dashboard()
+            await self._notify(f"ℹ️ Monitor-only mode {'enabled' if data.get('monitor_only') else 'disabled'}")
+        elif event == "deployment":
+            status = data.get("status", "unknown").upper()
+            commit = data.get("commit", "unknown")
+            summary = data.get("summary", "")
+            author = data.get("author", "")
+            details = data.get("details", "")
+            lines = [f"🚀 Deployment {status} — {commit}"]
+            if summary:
+                lines.append(summary)
+            if author:
+                lines.append(f"by {author}")
+            if details:
+                lines.append(details)
+            await self._notify("\n".join(lines))
+        elif event in {"safe_pause_pending", "safe_pause_ready", "panic", "resume", "shutdown", "admin_unknown"}:
             await self._notify(f"ℹ️ {event.replace('_', ' ').title()}: {json.dumps(data, ensure_ascii=False)}")
 
     async def _render_status(self, data: Dict[str, Any]) -> None:
@@ -233,18 +320,33 @@ class AdminControlBot:
 
     def _render_dashboard_text(self) -> str:
         opportunity_label = self._format_opportunity(self._state.get("opportunity_carry_limit"))
+        circuit_minutes = int(int(self._state.get("circuit_breaker_pause_seconds", 0) or 0) / 60)
+        monitor_flag = "Yes" if self._state.get("monitor_only") else "No"
         return (
             "⚙️ Engine Controls\n"
             f"Spread Δ: {self._state['fixed_spread_delta']}\n"
             f"Base Carry Limit: {self._state['base_carry_limit']}\n"
             f"Opportunity Limit: {opportunity_label}\n"
-            f"Auto ن Delay: {self._state['auto_n_delay_seconds']}s"
+            f"Auto ن Delay: {self._state['auto_n_delay_seconds']}s\n"
+            f"Spec Timeout: {self._state.get('speculative_trade_timeout_seconds', 0)}s | Source Expiry: {self._state.get('source_order_expiry_seconds', 0)}s\n"
+            f"Break-even Wait: {self._state.get('exit_break_even_timeout_seconds', 0)}s | Stop-loss Wait: {self._state.get('exit_stop_loss_timeout_seconds', 0)}s\n"
+            f"Stop-loss Offset: {self._state.get('stop_loss_price_offset', 0)} | Circuit Breaker: {circuit_minutes}m\n"
+            f"Monitor Only: {monitor_flag}"
         )
 
     def _build_keyboard(self) -> list[list[Button]]:
         base_limit = int(self._state.get("base_carry_limit", 1))
         opportunity = self._state.get("opportunity_carry_limit", 0)
         delay = int(self._state.get("auto_n_delay_seconds", 3))
+        predictive_delta = str(self._state.get("predictive_price_delta", 0))
+        suffix_digits = str(self._state.get("predictive_suffix_digits", 4))
+        spec_timeout = str(self._state.get("speculative_trade_timeout_seconds", 0))
+        source_expiry = str(self._state.get("source_order_expiry_seconds", 0))
+        break_even = str(self._state.get("exit_break_even_timeout_seconds", 0))
+        stop_loss_wait = str(self._state.get("exit_stop_loss_timeout_seconds", 0))
+        stop_loss_offset = str(self._state.get("stop_loss_price_offset", 0))
+        circuit_seconds = str(self._state.get("circuit_breaker_pause_seconds", 0))
+        monitor_current = "1" if self._state.get("monitor_only") else "0"
 
         rows: list[list[Button]] = []
         carry_row = [
@@ -267,6 +369,60 @@ class AdminControlBot:
         ]
         rows.append(delay_row)
 
+        predictive_row = [
+            self._option_button("predictive_delta", str(value), predictive_delta)
+            for value in (5, 10, 15)
+        ]
+        rows.append(predictive_row)
+
+        suffix_row = [
+            self._option_button("suffix", str(value), suffix_digits)
+            for value in (3, 4, 5)
+        ]
+        rows.append(suffix_row)
+
+        spec_row = [
+            self._option_button("spec_timeout", str(value), spec_timeout, label=f"{value}s")
+            for value in (30, 60, 120)
+        ]
+        rows.append(spec_row)
+
+        expiry_row = [
+            self._option_button("source_expiry", str(value), source_expiry, label=f"{value}s")
+            for value in (30, 60, 90)
+        ]
+        rows.append(expiry_row)
+
+        break_even_row = [
+            self._option_button("break_even", str(value), break_even, label=f"{value}s")
+            for value in (2, 5, 10)
+        ]
+        rows.append(break_even_row)
+
+        stop_loss_row = [
+            self._option_button("stop_loss_wait", str(value), stop_loss_wait, label=f"{value}s")
+            for value in (4, 8, 15)
+        ]
+        rows.append(stop_loss_row)
+
+        stop_offset_row = [
+            self._option_button("stop_loss_offset", str(value), stop_loss_offset)
+            for value in (5, 10, 20)
+        ]
+        rows.append(stop_offset_row)
+
+        circuit_row = [
+            self._option_button("circuit", str(value), circuit_seconds, label=f"{value // 60}m")
+            for value in (300, 600, 1800)
+        ]
+        rows.append(circuit_row)
+
+        monitor_row = [
+            self._option_button("monitor", "1", monitor_current, label="👁 Monitor On"),
+            self._option_button("monitor", "0", monitor_current, label="👁 Monitor Off"),
+        ]
+        rows.append(monitor_row)
+
         rows.append(
             [
                 Button.inline("⏸ Pause", b"command:pause"),
@@ -274,19 +430,25 @@ class AdminControlBot:
                 Button.inline("📊 Status", b"command:status"),
             ]
         )
+        rows.append(
+            [
+                Button.inline("🔴 Stop Engine", b"command:stop"),
+                Button.inline("🟢 Start Engine", b"command:start"),
+            ]
+        )
 
         return rows
 
     @staticmethod
-    def _option_button(prefix: str, value: str, current: str) -> Button:
-        label = value
+    def _option_button(prefix: str, value: str, current: str, label: Optional[str] = None) -> Button:
+        display = label or value
         comparison_value = value
         if value == "unlimited":
-            label = "∞"
+            display = "∞"
             comparison_value = "0"
         if comparison_value == current:
-            label = f"✅ {label}"
-        return Button.inline(label, f"{prefix}:{value}".encode("utf-8"))
+            display = f"✅ {display}"
+        return Button.inline(display, f"{prefix}:{value}".encode("utf-8"))
 
     @staticmethod
     def _format_opportunity(value: Any) -> str:

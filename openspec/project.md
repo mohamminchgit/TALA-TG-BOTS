@@ -370,6 +370,7 @@ DESTINATION_SESSION_FILE=sessions/destination.session
   3. Create a `.env.example` file in the repository root with all required environment variables (without sensitive values). This serves as a template that gets merged with the server's existing `.env` during deployment.
 - **How it works:**
   1. You push to `develop` branch
+  2. The workflow validates that all deployment secrets (`DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, `DEPLOY_PATH`) are present
   2. GitHub Actions creates a deployment archive (excluding `.env`, `data/`, `sessions/`)
   3. Archives the code and uploads it to the server via SSH
   4. Extracts the archive on the server
@@ -377,12 +378,14 @@ DESTINATION_SESSION_FILE=sessions/destination.session
   6. Preserves `sessions/` directory (never overwrites session files)
   7. Executes `docker compose up -d --build` to rebuild and restart containers
   8. Cleans up temporary files
+  9. Invokes `python3 scripts/admin_notify.py` on the server so the admin bot broadcasts deployment status (success/failure, commit author, and summary)
 - **Workflow file:** `.github/workflows/deploy-develop.yml` defines the automation. You can view deployment status in the GitHub Actions tab.
 - **Session files protection:** The workflow explicitly excludes `sessions/` from the archive, so your Telethon session files are never overwritten. Only code changes are deployed.
 - **Environment variable merging:** The `deployment/merge-env.sh` script intelligently merges `.env.example` (from the repository) with the server's existing `.env`:
   - Existing keys in `.env` are preserved (your production secrets stay intact)
   - New keys from `.env.example` are added (new configuration options are automatically available)
   - Comments and formatting from `.env.example` are maintained
+- **Admin notifications:** Deployment status (started, success, failure) appears automatically in the admin Telegram panel; commit hash, author, and title are included for quick reviews.
 - **Quick setup checklist:**
   1. Generate or copy your SSH private key (the one you use to connect to `rbot-server`)
   2. In GitHub: Repository → Settings → Secrets and variables → Actions → New repository secret
@@ -834,13 +837,15 @@ Admins can adjust engine parameters live, without restarting the system. All par
 | Parameter Name                   | Example Values         | Description |
 |----------------------------------|-----------------------|-------------|
 | CONFIRMATION_TIMEOUT_SECONDS     | 1s, 3s, 5s            | Trade confirmation wait time |
-| RECONCILIATION_INTERVAL_MINUTES  | 1, 5, 10              | State sync interval |
-| EXIT_STRATEGY_TIMEOUT_SECONDS    | 2, 5, 10              | Layer 2 exit wait |
-| EMERGENCY_TIMEOUT_SECONDS        | 4, 8, 15              | Layer 3 exit wait |
-| CIRCUIT_BREAKER_DURATION_MINUTES | 10, 30, 60            | Post-emergency halt |
-| EXECUTED_CACHE_EXPIRATION_HOURS  | 1, 2, 6               | Redis cache expiry |
-| PREDICTIVE_SPREAD                | 5, 10, 20             | Speculative order spread |
-| SPECULATIVE_TRADE_TIMEOUT_SECONDS| 15, 30, 60            | Speculative order timeout |
+| EXIT_STRATEGY_TIMEOUT_SECONDS    | 2s, 5s, 10s           | Break-even (Layer 2) wait |
+| EMERGENCY_TIMEOUT_SECONDS        | 4s, 8s, 15s           | Stop-loss (Layer 3) wait |
+| STOP_LOSS_PRICE_OFFSET           | 5, 10, 20             | Price offset before emergency exit |
+| CIRCUIT_BREAKER_DURATION_MINUTES | 5, 10, 30             | Post-emergency halt duration |
+| AUTO_N_DELAY_SECONDS             | 0, 3, 10, 30          | Delay before sending `ن` acknowledgements |
+| PREDICTIVE_PRICE_DELTA           | 5, 10, 15             | Speculative spread delta |
+| PREDICTIVE_SUFFIX_DIGITS         | 3, 4, 5               | Digits appended to speculative orders |
+| SPECULATIVE_TRADE_TIMEOUT_SECONDS| 30, 60, 120           | Destination fill timeout |
+| SOURCE_ORDER_EXPIRY_SECONDS      | 30, 60, 90            | Lifetime of source confirmations |
 
 #### **6.2.2. Exit Strategy Layer Control**
 
@@ -857,13 +862,15 @@ The bot periodically (e.g., hourly) or on-demand posts performance reports in th
 #### **6.2.4. Operational Status Control**
 
 *   **Panic Button:** Instantly halts all trading activity. No new opportunities are processed.
-*   **Resume:** Reactivates the engine after a halt.
+*   **Pause / Resume:** Toggle monitor-only mode so orders can drain safely.
+*   **Stop / Start Engine:** Issue a full shutdown or restart without SSH access.
 
 #### **6.2.5. Alerts & Notifications**
 
 *   **Service Outage Alerts:** If any Docker container (bot_agent_A, bot_agent_B, engine) goes down, an immediate alert is posted. This is implemented via a health check service.
 *   **Emergency Exit Reports:** Every time a trade reaches Layer 4 (emergency liquidation), details are posted instantly.
 *   **Critical Error Reports:** Any unexpected engine or bot error is reported for admin review.
+*   **Deployment Broadcasts:** On every CI deploy the admin bot posts status (started/success/failed), commit hash, author, and summary.
 
 #### **6.2.6. Monitor-Only Mode**
 

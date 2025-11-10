@@ -194,6 +194,17 @@ async def _run_engine(settings: Settings) -> None:
 			status_refresh_seconds=settings.admin_bot.status_refresh_seconds,
 			source_alias=settings.source_bot.alias,
 			destination_alias=settings.destination_bot.alias,
+			engine_config={
+				"predictive_price_delta": settings.engine.predictive_price_delta,
+				"predictive_suffix_digits": settings.engine.predictive_suffix_digits,
+				"speculative_trade_timeout_seconds": settings.engine.speculative_trade_timeout_seconds,
+				"source_order_expiry_seconds": settings.engine.source_order_expiry_seconds,
+				"exit_break_even_timeout_seconds": settings.engine.exit_break_even_timeout_seconds,
+				"exit_stop_loss_timeout_seconds": settings.engine.exit_stop_loss_timeout_seconds,
+				"stop_loss_price_offset": settings.engine.stop_loss_price_offset,
+				"circuit_breaker_pause_seconds": settings.engine.circuit_breaker_pause_seconds,
+			},
+			initial_monitor_only=engine_state.monitor_only,
 		)
 		admin_service.register_shutdown_callback(admin_bot_controller.stop)
 

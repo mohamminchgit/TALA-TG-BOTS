@@ -157,18 +157,30 @@ class AdminCommandService:
             self._predictive.update_speculative_timeout(value)
             applied["speculative_trade_timeout_seconds"] = value
 
+        if "source_order_expiry_seconds" in updates:
+            value = int(updates["source_order_expiry_seconds"])
+            self._predictive.update_source_expiry_seconds(value)
+            applied["source_order_expiry_seconds"] = value
+
         risk_params: Dict[str, Any] = {}
         if "exit_break_even_timeout_seconds" in updates:
-            risk_params["break_even_timeout_seconds"] = int(updates["exit_break_even_timeout_seconds"])
+            value = int(updates["exit_break_even_timeout_seconds"])
+            risk_params["break_even_timeout_seconds"] = value
+            applied["exit_break_even_timeout_seconds"] = value
         if "exit_stop_loss_timeout_seconds" in updates:
-            risk_params["stop_loss_timeout_seconds"] = int(updates["exit_stop_loss_timeout_seconds"])
+            value = int(updates["exit_stop_loss_timeout_seconds"])
+            risk_params["stop_loss_timeout_seconds"] = value
+            applied["exit_stop_loss_timeout_seconds"] = value
         if "stop_loss_price_offset" in updates:
-            risk_params["stop_loss_price_offset"] = int(updates["stop_loss_price_offset"])
+            value = int(updates["stop_loss_price_offset"])
+            risk_params["stop_loss_price_offset"] = value
+            applied["stop_loss_price_offset"] = value
         if "circuit_breaker_pause_seconds" in updates:
-            risk_params["circuit_breaker_seconds"] = int(updates["circuit_breaker_pause_seconds"])
+            value = int(updates["circuit_breaker_pause_seconds"])
+            risk_params["circuit_breaker_seconds"] = value
+            applied["circuit_breaker_pause_seconds"] = value
         if risk_params:
             self._risk_manager.update_parameters(**risk_params)
-            applied.update(risk_params)
 
         if "auto_n_delay_seconds" in updates:
             delay = int(updates["auto_n_delay_seconds"])
@@ -270,6 +282,11 @@ class AdminCommandService:
             "predictive_price_delta",
             "predictive_suffix_digits",
             "speculative_trade_timeout_seconds",
+            "source_order_expiry_seconds",
+            "exit_break_even_timeout_seconds",
+            "exit_stop_loss_timeout_seconds",
+            "stop_loss_price_offset",
+            "circuit_breaker_pause_seconds",
             "auto_n_delay_seconds",
         }
         entries = {key: applied[key] for key in applied if key in persist_keys}
