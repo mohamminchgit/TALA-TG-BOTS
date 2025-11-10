@@ -68,9 +68,9 @@ project/
 └─ README.md
 ```
 
----
+----#
 
-## 2. Code Style & Quality
+## 2. Code Style && Quality
 
 ### **2.1. Code Formatting & Standards**
 - **Python Version:** Python 3.10+
