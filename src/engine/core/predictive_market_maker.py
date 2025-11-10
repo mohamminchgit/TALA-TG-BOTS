@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from src.common.redis import RedisManager
+from src.common.utils import normalize_persian_numbers
 from src.engine.core.order_book import OrderBook
 from src.engine.core.engine_state import EngineState
 from src.engine.core.trade_tracker import TradeContext, TradeTracker
@@ -26,13 +27,22 @@ class PendingPredictiveTrade:
     destination_price: int
     direction: str
     expected_spread: int
+    source_alias: str = ""
+    source_alias_normalized: str = ""
     destination_message_id: Optional[int] = None
     destination_supervisor_message_id: Optional[int] = None
     source_supervisor_message_id: Optional[int] = None
     stage: str = "awaiting_post_ack"
     created_at: float = field(default_factory=time.time)
     timeout_task: Optional[asyncio.Task] = None
+    source_expiry_task: Optional[asyncio.Task] = None
     context_registered: bool = False
+
+
+def _normalize_alias(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return normalize_persian_numbers(value).strip().lower()
 
 
 class PredictiveMarketMaker:
@@ -50,6 +60,7 @@ class PredictiveMarketMaker:
         speculative_timeout_seconds: int,
         destination_alias: str,
         policy: TradePolicy,
+        source_expiry_seconds: int,
     ) -> None:
         self._order_book = order_book
         self._redis = redis_manager
@@ -65,13 +76,33 @@ class PredictiveMarketMaker:
         self._pending: Dict[str, PendingPredictiveTrade] = {}
         self._source_index: Dict[int, str] = {}
         self._lock = asyncio.Lock()
+        self._source_expiry_seconds = max(1, source_expiry_seconds)
 
     async def process_event(self, event: Dict[str, Any]) -> None:
         await self._check_source_orders()
 
-        if event.get("group_label") != "source":
+        group_label = event.get("group_label")
+        category = event.get("category")
+
+        if group_label == "source" and category == "cancel_all":
+            message_meta = event.get("message") or {}
+            details = event.get("details") or {}
+            sender = event.get("sender") or {}
+            reply_to = message_meta.get("reply_to")
+            alias_hint = details.get("alias") or details.get("alias_normalized")
+            if not alias_hint:
+                alias_hint = sender.get("display_name") or sender.get("username")
+            await self._cancel_for_source_reference(reply_to=reply_to, alias=alias_hint, reason="source_cancelled")
             return
-        if event.get("category") not in {"sell_order", "buy_order"}:
+
+        if group_label == "source" and category == "trade_confirmation":
+            details = event.get("details") or {}
+            for alias in (details.get("buyer"), details.get("seller")):
+                if alias:
+                    await self._cancel_for_source_reference(alias=alias, reason="source_fulfilled")
+            return
+
+        if group_label != "source" or category not in {"sell_order", "buy_order"}:
             return
 
         if self._engine_state and not self._engine_state.can_trade():
@@ -123,6 +154,8 @@ class PredictiveMarketMaker:
                 destination_price=target_price,
                 direction=direction,
                 expected_spread=expected_spread,
+                source_alias=entry.alias,
+                source_alias_normalized=entry.alias_normalized,
             )
             self._pending[trade_id] = pending
             self._source_index[message_id] = trade_id
@@ -155,6 +188,7 @@ class PredictiveMarketMaker:
         )
 
         await self._save_state(pending)
+        self._ensure_source_expiry(pending)
 
     async def handle_execution_result(self, payload: Dict[str, Any]) -> None:
         trade_id = payload.get("trade_id")
@@ -206,6 +240,11 @@ class PredictiveMarketMaker:
             with contextlib.suppress(asyncio.CancelledError):
                 await pending.timeout_task
             pending.timeout_task = None
+        if pending.source_expiry_task:
+            pending.source_expiry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending.source_expiry_task
+            pending.source_expiry_task = None
 
         confirmation_message_id = details.get("confirmation_message_id")
         if confirmation_message_id is not None:
@@ -298,6 +337,22 @@ class PredictiveMarketMaker:
     async def _finalize_trade(self, pending: PendingPredictiveTrade) -> None:
         await self._cleanup(pending.trade_id)
 
+    def _ensure_source_expiry(self, pending: PendingPredictiveTrade) -> None:
+        if pending.source_expiry_task is not None:
+            return
+
+        async def _expire() -> None:
+            try:
+                await asyncio.sleep(self._source_expiry_seconds)
+            except asyncio.CancelledError:
+                raise
+            await self._cancel_pending_trade(pending, reason="timeout")
+
+        pending.source_expiry_task = asyncio.create_task(
+            _expire(),
+            name=f"pred-source-expiry-{pending.trade_id}",
+        )
+
     async def _schedule_timeout(self, pending: PendingPredictiveTrade) -> None:
         if pending.timeout_task is not None:
             return
@@ -340,6 +395,10 @@ class PredictiveMarketMaker:
             pending.timeout_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await pending.timeout_task
+        if pending and pending.source_expiry_task:
+            pending.source_expiry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending.source_expiry_task
         await self._redis.delete(self._state_key(trade_id))
         if pending:
             await self._redis.delete(self._source_index_key(pending.source_message_id))
@@ -354,6 +413,50 @@ class PredictiveMarketMaker:
             entry = self._order_book.get_entry("source", pending.source_message_id)
             if entry is None:
                 await self._cancel_pending_trade(pending, reason="source_unavailable")
+
+    async def _cancel_for_source_reference(
+        self,
+        *,
+        reply_to: Optional[int] = None,
+        alias: Optional[str] = None,
+        reason: str,
+    ) -> None:
+        candidates: list[PendingPredictiveTrade] = []
+        async with self._lock:
+            trade_ids: list[str] = []
+            if reply_to is not None:
+                try:
+                    reply_id = int(reply_to)
+                except (TypeError, ValueError):
+                    reply_id = None
+                if reply_id is not None:
+                    trade_id = self._source_index.get(reply_id)
+                    if trade_id:
+                        trade_ids.append(trade_id)
+            if not candidates and alias:
+                alias_norm = _normalize_alias(alias)
+                if alias_norm:
+                    for trade_id, pending in self._pending.items():
+                        if pending.source_alias_normalized == alias_norm:
+                            trade_ids.append(trade_id)
+            seen: set[str] = set()
+            for trade_id in trade_ids:
+                if trade_id in seen:
+                    continue
+                seen.add(trade_id)
+                pending = self._pending.get(trade_id)
+                if pending:
+                    candidates.append(pending)
+        if not candidates:
+            logger.debug(
+                "Predictive cancel request ignored (reason=%s reply_to=%s alias=%s)",
+                reason,
+                reply_to,
+                alias,
+            )
+            return
+        for pending in candidates:
+            await self._cancel_pending_trade(pending, reason=reason)
 
     def _should_post_speculative(self, direction: TradeDirection, source_price: int, target_price: int) -> bool:
         if direction == "source_sell":

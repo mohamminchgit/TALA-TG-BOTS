@@ -350,7 +350,7 @@ class OrderBook:
         sender = event.get("sender") or {}
 
         alias = details.get("alias") or sender.get("display_name") or sender.get("username") or ""
-        alias_normalized = _normalize_alias(alias)
+        alias_normalized = details.get("alias_normalized") or _normalize_alias(alias)
 
         removed_ids: List[int] = []
         if reply_to is not None:
@@ -374,6 +374,13 @@ class OrderBook:
                 len(set(removed_ids)),
                 group_label,
                 alias or "<unknown>",
+            )
+        else:
+            logger.info(
+                "No matching orders found to cancel in %s for alias %s (reply_to=%s)",
+                group_label,
+                alias or "<unknown>",
+                reply_to,
             )
 
     def _handle_full_match(self, group_label: OrderGroup, event: Dict[str, Any]) -> None:

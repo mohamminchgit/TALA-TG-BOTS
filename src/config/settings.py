@@ -91,6 +91,7 @@ class EngineConfig:
     fixed_spread_delta: int
     base_carry_limit: int
     opportunity_carry_limit: int
+    source_order_expiry_seconds: int
 
 
 @dataclass(frozen=True)
@@ -188,7 +189,7 @@ def get_settings(env_path: Optional[Path] = None) -> Settings:
         executed_trades_cache_ttl_seconds=max(0, _int_env("EXECUTED_CACHE_EXPIRATION_SECONDS", 3600)),
         predictive_price_delta=predictive_price_delta,
         predictive_suffix_digits=predictive_suffix_digits,
-        speculative_trade_timeout_seconds=max(1, _int_env("SPECULATIVE_TRADE_TIMEOUT_SECONDS", 30)),
+        speculative_trade_timeout_seconds=max(1, _int_env("SPECULATIVE_TRADE_TIMEOUT_SECONDS", 60)),
         exit_break_even_timeout_seconds=max(1, _int_env("EXIT_STRATEGY_TIMEOUT_SECONDS", 2)),
         exit_stop_loss_timeout_seconds=max(1, _int_env("EMERGENCY_TIMEOUT_SECONDS", 4)),
         stop_loss_price_offset=max(1, _int_env("STOP_LOSS_PRICE_OFFSET", 5)),
@@ -196,6 +197,7 @@ def get_settings(env_path: Optional[Path] = None) -> Settings:
         fixed_spread_delta=fixed_spread_delta,
         base_carry_limit=base_carry_limit,
         opportunity_carry_limit=opportunity_carry_limit,
+        source_order_expiry_seconds=max(1, _int_env("SOURCE_ORDER_EXPIRY_SECONDS", 60)),
     )
 
     admin_bot_token = os.getenv("ADMIN_BOT_TOKEN")

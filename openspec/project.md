@@ -807,7 +807,8 @@ This strategy introduces a new risk: the speculative order may never be filled, 
 | **`CIRCUIT_BREAKER_DURATION_MINUTES`**     | **10 minutes**    | The duration the bot halts all activities after an emergency liquidation.                               |
 | **`EXECUTED_CACHE_EXPIRATION_HOURS`**      | **1 hour**        | The time an executed trade's `MessageID` remains in the Redis cache to prevent reprocessing.            |
 | **`PREDICTIVE_SPREAD`**                    | **10**            | The price difference the engine uses to place a speculative order in the destination group.             |
-| **`SPECULATIVE_TRADE_TIMEOUT_SECONDS`**    | **30 seconds**    | The maximum time the engine will wait for a speculative order to be filled before cancelling it.        
+| **`SPECULATIVE_TRADE_TIMEOUT_SECONDS`**    | **60 seconds**    | The maximum time the engine will wait for a speculative order to be filled before cancelling it.        |
+| **`SOURCE_ORDER_EXPIRY_SECONDS`**          | **60 seconds**    | Time after which an unfilled source confirmation expires and mirrored destination exposure is cancelled. |
 
 ---
 

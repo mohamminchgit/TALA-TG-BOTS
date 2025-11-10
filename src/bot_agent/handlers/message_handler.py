@@ -13,6 +13,16 @@ from src.common.constants import (
     TRADE_CONFIRMATION_PATTERN,
 )
 from src.common.utils import normalize_persian_numbers
+def _extract_alias_from_order_message(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = ORDER_BUY_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    match = ORDER_SELL_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +138,30 @@ async def handle_group_message(agent: "BotAgent", event: events.NewMessage.Event
     chat_id = event.chat_id
     sender = await event.get_sender()
     sender_name = getattr(sender, "first_name", None) or getattr(sender, "username", "Unknown")
+
+    if classification.category == "cancel_all":
+        details = dict(classification.details or {})
+        reply_to = getattr(event.message, "reply_to_msg_id", None) if event.message else None
+        details["mode"] = "reply" if reply_to is not None else "standalone"
+        alias_hint: Optional[str] = None
+        if reply_to is not None:
+            try:
+                reply_message = await event.get_reply_message()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Failed to fetch reply message for cancellation: %s", exc)
+                reply_message = None
+            if reply_message and reply_message.raw_text:
+                alias_hint = _extract_alias_from_order_message(reply_message.raw_text)
+                if alias_hint:
+                    details["reply_text"] = reply_message.raw_text
+        if not alias_hint:
+            alias_hint = getattr(sender, "first_name", None) or getattr(sender, "username", None)
+        if alias_hint:
+            alias_normalized = normalize_persian_numbers(alias_hint).strip()
+            if alias_normalized:
+                details.setdefault("alias", alias_hint.strip())
+                details.setdefault("alias_normalized", alias_normalized.lower())
+        classification.details = details
 
     logger.info(
         "%s observed %s message from %s in chat %s: %s",

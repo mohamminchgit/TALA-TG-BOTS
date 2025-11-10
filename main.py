@@ -146,6 +146,7 @@ async def _run_engine(settings: Settings) -> None:
 		speculative_timeout_seconds=settings.engine.speculative_trade_timeout_seconds,
 		destination_alias=settings.destination_bot.alias,
 		policy=policy,
+		source_expiry_seconds=settings.engine.source_order_expiry_seconds,
 	)
 	manager = OrderBookManager(
 		redis_manager=redis_manager,
