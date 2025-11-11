@@ -17,12 +17,10 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $archiveName = "tala-bot-$timestamp.tar.gz"
 $archivePath = Join-Path $PSScriptRoot $archiveName
 
-# مسیر فایل .env محلی
 $localEnvFile = Join-Path $root ".env"
 
 Push-Location $root
 try {
-    # آرگومان‌های tar را برای شامل کردن .env با نام جدید آماده می‌کنیم
     $tarArgs = @(
         "czf", $archivePath,
         "--exclude=.git",
@@ -37,7 +35,6 @@ try {
         $tarArgs += @("--transform", "s|^\.env$|.env.example|", ".env")
     }
     
-    # بقیه فایل‌ها را اضافه کن
     $tarArgs += "."
     
     & tar @tarArgs
@@ -48,7 +45,7 @@ finally {
 
 & scp $archivePath "$User@${targetHost}:/tmp/$archiveName"
 
-# حالا دستور ریموت از merge-env.sh اصلاح شده استفاده می‌کند
+# دستورات ریموت که شامل اجرای merge-env.sh هم می‌شود
 $remoteCommand = "mkdir -p $RemotePath && tar -xzf /tmp/$archiveName -C $RemotePath --strip-components=1 && cd $RemotePath && bash deployment/merge-env.sh . && cd deployment && docker compose up -d --build && rm /tmp/$archiveName"
 & ssh "$User@$targetHost" $remoteCommand
 
