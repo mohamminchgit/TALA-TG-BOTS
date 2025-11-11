@@ -5,11 +5,14 @@ import contextlib
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from telethon import Button, TelegramClient, events
 
 from src.common.redis import RedisManager, StreamMessage
+from src.common.session_onboarding import OnboardingConfig, SessionOnboarding
+from src.common.session_store import SessionStatus, SessionStore
 from src.engine.core.trade_policy import PolicySnapshot
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,9 @@ class AdminControlBot:
         destination_alias: str,
         engine_config: Dict[str, Any],
         initial_monitor_only: bool,
+        session_store: SessionStore,
+        session_onboarding: SessionOnboarding,
+        session_configs: Dict[str, Dict[str, Optional[str]]],
     ) -> None:
         self._redis = redis_manager
         self._api_id = api_id
@@ -66,11 +72,23 @@ class AdminControlBot:
         }
         self._report_group = "admin_reports"
         self._report_consumer = f"admin-bot-{uuid.uuid4().hex}"
+        self._session_store = session_store
+        self._session_onboarding = session_onboarding
+        self._session_configs = session_configs
+        self._session_status: Dict[str, SessionStatus] = {}
+        self._code_prompts: Dict[str, asyncio.Future[str]] = {}
+        self._password_prompts: Dict[str, asyncio.Future[Optional[str]]] = {}
+        self._session_tasks: Dict[str, asyncio.Task] = {}
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def run(self) -> None:
         await self._client.start(bot_token=self._bot_token)
+        self._loop = asyncio.get_running_loop()
         self._client.add_event_handler(self._on_start, events.NewMessage(pattern=r"/start"))
+        self._client.add_event_handler(self._on_code_command, events.NewMessage(pattern=r"/code\s+(\S+)\s+(\S+)"))
+        self._client.add_event_handler(self._on_password_command, events.NewMessage(pattern=r"/password\s+(\S+)\s+(.+)"))
         self._client.add_event_handler(self._on_callback, events.CallbackQuery())
+        await self._refresh_session_status()
         await self._send_dashboard(initial=True)
         self._report_task = asyncio.create_task(self._consume_reports(), name="admin-bot-reports")
         try:
@@ -92,6 +110,33 @@ class AdminControlBot:
         if event.chat_id != self._chat_id:
             return
         await self._send_dashboard()
+
+    async def _on_code_command(self, event: events.NewMessage.Event) -> None:
+        if event.chat_id != self._chat_id:
+            return
+        role = event.pattern_match.group(1).lower()
+        code = event.pattern_match.group(2).strip()
+        future = self._code_prompts.get(role)
+        if not future:
+            await event.reply("درخواستی برای این ربات فعال نیست.")
+            return
+        if not future.done():
+            future.set_result(code)
+            await event.reply("✅ کد دریافت شد.")
+
+    async def _on_password_command(self, event: events.NewMessage.Event) -> None:
+        if event.chat_id != self._chat_id:
+            return
+        role = event.pattern_match.group(1).lower()
+        password_raw = event.pattern_match.group(2).strip()
+        future = self._password_prompts.get(role)
+        if not future:
+            await event.reply("درخواستی برای این ربات فعال نیست.")
+            return
+        if not future.done():
+            password = None if password_raw.lower() in {"none", "null", "0"} else password_raw
+            future.set_result(password)
+            await event.reply("✅ گذرواژه دریافت شد.")
 
     async def _on_callback(self, event: events.CallbackQuery.Event) -> None:
         if event.chat_id != self._chat_id:
@@ -166,6 +211,10 @@ class AdminControlBot:
         elif data == "command:stop":
             await self._publish_command({"command": "shutdown"})
             await event.answer("Shutdown requested")
+        elif data.startswith("session:start:"):
+            role = data.split(":", 2)[2]
+            await self._handle_session_start(role, event)
+            return
         elif data == "command:start":
             await self._publish_command({"command": "resume"})
             await event.answer("Start requested")
@@ -188,6 +237,7 @@ class AdminControlBot:
 
     async def _send_dashboard(self, *, initial: bool = False) -> None:
         async with self._dashboard_lock:
+            await self._refresh_session_status()
             text = self._render_dashboard_text()
             keyboard = self._build_keyboard()
             if initial or not self._dashboard_message_id:
@@ -206,6 +256,7 @@ class AdminControlBot:
                     await self._client.send_message(self._chat_id, text, buttons=keyboard)
 
     async def _refresh_dashboard(self) -> None:
+        await self._refresh_session_status()
         if not self._dashboard_message_id:
             return
         await self._send_dashboard()
@@ -335,6 +386,39 @@ class AdminControlBot:
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning("Failed to send admin notification: %s", exc)
 
+    def _format_session_lines(self) -> str:
+        if not self._session_configs:
+            return "🔐 وضعیت سشن‌ها: پیکربندی نشده است."
+        lines = ["🔐 وضعیت سشن‌ها:"]
+        now = datetime.now(timezone.utc)
+        for role in self._session_configs.keys():
+            alias = self._aliases.get(role, role.title())
+            status = self._session_status.get(role)
+            if status and status.exists:
+                icon = "✅"
+                updated = status.updated_at
+                if updated is None:
+                    updated_text = "نامشخص"
+                else:
+                    if updated.tzinfo is None:
+                        updated = updated.replace(tzinfo=timezone.utc)
+                    updated_text = updated.astimezone().strftime("%Y-%m-%d %H:%M")
+            else:
+                icon = "❌"
+                updated_text = "نامشخص"
+            flood_note = ""
+            if status and status.flood_wait_until:
+                wait_until = status.flood_wait_until
+                if wait_until.tzinfo is None:
+                    wait_until = wait_until.replace(tzinfo=timezone.utc)
+                if wait_until > now:
+                    delta = wait_until - now
+                    minutes = int(delta.total_seconds() // 60)
+                    seconds = int(delta.total_seconds() % 60)
+                    flood_note = f" (FloodWait: {minutes:02d}:{seconds:02d})"
+            lines.append(f"  - {alias}: {icon} (آخرین بروزرسانی: {updated_text}){flood_note}")
+        return "\n".join(lines)
+
     def _render_dashboard_text(self) -> str:
         opportunity_label = self._format_opportunity(self._state.get("opportunity_carry_limit"))
         circuit_minutes = int(int(self._state.get("circuit_breaker_pause_seconds", 0) or 0) / 60)
@@ -348,7 +432,8 @@ class AdminControlBot:
             f"Spec Timeout: {self._state.get('speculative_trade_timeout_seconds', 0)}s | Source Expiry: {self._state.get('source_order_expiry_seconds', 0)}s\n"
             f"Break-even Wait: {self._state.get('exit_break_even_timeout_seconds', 0)}s | Stop-loss Wait: {self._state.get('exit_stop_loss_timeout_seconds', 0)}s\n"
             f"Stop-loss Offset: {self._state.get('stop_loss_price_offset', 0)} | Circuit Breaker: {circuit_minutes}m\n"
-            f"Monitor Only: {monitor_flag}"
+            f"Monitor Only: {monitor_flag}\n"
+            f"{self._format_session_lines()}"
         )
 
     def _build_keyboard(self) -> list[list[Button]]:
@@ -366,6 +451,14 @@ class AdminControlBot:
         monitor_current = "1" if self._state.get("monitor_only") else "0"
 
         rows: list[list[Button]] = []
+        session_row: list[Button] = []
+        if "source" in self._session_configs:
+            session_row.append(Button.inline("🔐 سشن سورس", b"session:start:source"))
+        if "destination" in self._session_configs:
+            session_row.append(Button.inline("🔐 سشن مقصد", b"session:start:destination"))
+        if session_row:
+            rows.append(session_row)
+
         carry_row = [
             self._option_button("carry", str(value), str(base_limit))
             for value in (1, 2, 3, 4)
@@ -455,6 +548,153 @@ class AdminControlBot:
         )
 
         return rows
+
+    async def _refresh_session_status(self) -> None:
+        if not self._session_configs:
+            self._session_status = {}
+            return
+
+        session_keys = {role: cfg["session_key"] for role, cfg in self._session_configs.items()}
+
+        def fetch() -> dict[str, SessionStatus]:
+            return self._session_store.get_statuses(list(session_keys.values()))
+
+        statuses_by_key = await asyncio.to_thread(fetch)
+        combined: Dict[str, SessionStatus] = {}
+        for role, key in session_keys.items():
+            status = statuses_by_key.get(key)
+            if status is None:
+                status = SessionStatus(
+                    session_name=key,
+                    exists=False,
+                    phone_number=None,
+                    bot_role=None,
+                    updated_at=None,
+                    flood_wait_until=None,
+                    last_error=None,
+                )
+            combined[role] = status
+        self._session_status = combined
+
+    async def _handle_session_start(self, role: str, event: events.CallbackQuery.Event) -> None:
+        role = role.lower()
+        config = self._session_configs.get(role)
+        if not config:
+            await event.answer("ربات ناشناخته است.", alert=True)
+            return
+        task = self._session_tasks.get(role)
+        if task and not task.done():
+            await event.answer("فرآیند دریافت سشن در حال اجراست.", alert=True)
+            return
+
+        phone = config.get("phone_number")
+        if not phone:
+            await event.answer("شماره ربات تعریف نشده است.", alert=True)
+            return
+
+        await event.answer("کد ارسال می‌شود...", alert=False)
+        login_task = asyncio.create_task(
+            self._run_session_flow(
+                role=role,
+                session_key=config["session_key"],
+                phone_number=phone,
+                phone_password=config.get("phone_password"),
+            )
+        )
+        self._session_tasks[role] = login_task
+
+    async def _run_session_flow(
+        self,
+        *,
+        role: str,
+        session_key: str,
+        phone_number: str,
+        phone_password: Optional[str],
+    ) -> None:
+        try:
+            config = OnboardingConfig(
+                session_key=session_key,
+                bot_role=role,
+                phone_number=phone_number,
+                phone_password=phone_password,
+            )
+            await self._session_onboarding.ensure_session(
+                config,
+                prompt_code=lambda _, __: self._wait_for_code(role, phone_number),
+                prompt_password=lambda _: self._wait_for_password(role, phone_password),
+                notify_flood_wait=lambda _, seconds: self._notify_flood(role, seconds),
+            )
+            self._session_configs.setdefault(role, {})["phone_number"] = phone_number
+            await self._client.send_message(
+                self._chat_id,
+                f"✅ سشن {self._aliases.get(role, role)} با موفقیت ذخیره شد.",
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception("Session onboarding failed for %s", role)
+            await self._client.send_message(
+                self._chat_id,
+                f"❌ خطا در دریافت سشن {role}: {exc}",
+            )
+        finally:
+            code_future = self._code_prompts.pop(role, None)
+            if code_future and not code_future.done():
+                code_future.cancel()
+            password_future = self._password_prompts.pop(role, None)
+            if password_future and not password_future.done():
+                password_future.cancel()
+            self._session_tasks.pop(role, None)
+            await self._refresh_session_status()
+            await self._refresh_dashboard()
+
+    async def _wait_for_code(self, role: str, phone_number: str) -> str:
+        if self._loop is None:
+            raise RuntimeError("Event loop not initialized")
+        previous = self._code_prompts.pop(role, None)
+        if previous and not previous.done():
+            previous.cancel()
+        future = self._loop.create_future()
+        self._code_prompts[role] = future
+        await self._client.send_message(
+            self._chat_id,
+            f"📨 کد برای {self._aliases.get(role, role)} ({phone_number}) ارسال شد.\n"
+            f"لطفاً دستور `/code {role} <کد>` را وارد کن.",
+        )
+        return await future
+
+    async def _wait_for_password(self, role: str, preset: Optional[str]) -> Optional[str]:
+        if preset:
+            self._session_configs.setdefault(role, {})["phone_password"] = preset
+            return preset
+        if self._loop is None:
+            raise RuntimeError("Event loop not initialized")
+        previous = self._password_prompts.pop(role, None)
+        if previous and not previous.done():
+            previous.cancel()
+        future = self._loop.create_future()
+        self._password_prompts[role] = future
+        await self._client.send_message(
+            self._chat_id,
+            f"🔑 اگر گذرواژه دو مرحله‌ای برای {self._aliases.get(role, role)} داری، دستور `/password {role} <گذرواژه>` را بفرست.\n"
+            f"اگر گذرواژه نداری، `/password {role} none` را ارسال کن.",
+        )
+        value = await future
+        self._session_configs.setdefault(role, {})["phone_password"] = value
+        return value
+
+    async def _notify_flood(self, role: str, seconds: int) -> None:
+        if seconds <= 0:
+            await self._client.send_message(
+                self._chat_id,
+                f"❌ کد وارد شده برای {self._aliases.get(role, role)} اشتباه بود. لطفاً دوباره ارسال کن.",
+            )
+            return
+
+        wait_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        await self._client.send_message(
+            self._chat_id,
+            f"⏳ FloodWait برای {self._aliases.get(role, role)} تا {wait_until.astimezone().strftime('%Y-%m-%d %H:%M:%S')} فعال است.",
+        )
+        await self._refresh_session_status()
 
     @staticmethod
     def _option_button(prefix: str, value: str, current: str, label: Optional[str] = None) -> Button:

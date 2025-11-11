@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import getpass
 import json
 import logging
 import sys
@@ -10,6 +11,7 @@ from src.admin_bot import AdminControlBot
 from src.bot_agent.agent import BotAgent
 from src.common.db import DatabaseManager
 from src.common.redis import RedisChannels, RedisManager
+from src.common.session_onboarding import OnboardingConfig, SessionOnboarding
 from src.common.session_store import SessionStore
 from src.config.settings import Settings, get_settings
 from src.engine.core.engine_state import EngineState
@@ -71,6 +73,71 @@ async def _monitor_results(redis_manager: RedisManager, channel: str) -> None:
 	except asyncio.CancelledError:
 		logging.info("Result monitoring stopped")
 
+
+async def _ensure_sessions(settings: Settings) -> None:
+	database = DatabaseManager(settings.database.url)
+	database.initialize_schema()
+	store = SessionStore(database)
+	onboarding = SessionOnboarding(
+		api_id=settings.telegram.api_id,
+		api_hash=settings.telegram.api_hash,
+		session_store=store,
+	)
+
+	async def prompt_code(role: str, phone: str) -> str:
+		code = input(f"کد ارسال‌شده برای {role} ({phone}) را وارد کن: ").strip().replace(" ", "")
+		return code
+
+	async def prompt_password(role: str) -> Optional[str]:
+		password = getpass.getpass("گذرواژه دو مرحله‌ای (در صورت وجود) را وارد کن: ")
+		return password or None
+
+	async def notify_flood(role: str, seconds: int) -> None:
+		if seconds <= 0:
+			print(f"❌ کد وارد شده برای {role} اشتباه بود.")
+		else:
+			minutes = seconds // 60
+			remain = seconds % 60
+			print(f"⏳ FloodWait برای {role}: لطفاً {minutes} دقیقه و {remain} ثانیه صبر کن.")
+
+	bots = [
+		("source", settings.source_bot),
+		("destination", settings.destination_bot),
+	]
+	created_any = False
+
+	for role, bot in bots:
+		status = store.get_status(bot.session_key)
+		if status.exists:
+			updated = status.updated_at.isoformat() if status.updated_at else "نامشخص"
+			print(f"✅ سشن {role} موجود است (آخرین به‌روزرسانی: {updated}).")
+			continue
+
+		number = bot.phone_number or input(f"شماره ربات {role} را وارد کن: ").strip()
+		if not number:
+			print(f"⚠️ شماره برای {role} مشخص نشد؛ این مرحله رد شد.")
+			continue
+		password = bot.phone_password or None
+		print(f"🤖 شروع فرآیند لاگین برای {role} ({number})")
+		config = OnboardingConfig(
+			session_key=bot.session_key,
+			bot_role=role,
+			phone_number=number,
+			phone_password=password,
+		)
+		await onboarding.ensure_session(
+			config,
+			prompt_code=prompt_code,
+			prompt_password=prompt_password,
+			notify_flood_wait=notify_flood,
+		)
+		print(f"🎉 سشن {role} با موفقیت ذخیره شد.")
+		created_any = True
+
+	if not created_any and not any(store.get_status(bot.session_key).exists for _, bot in bots):
+		print("⚠️ هیچ سشنی ذخیره نشد. لطفاً دوباره بررسی کن.")
+	else:
+		print("✅ اطمینان از سشن‌ها به پایان رسید.")
 
 async def _run_agents(settings: Settings) -> None:
 	logging.info("🚀 Starting Telegram Arbitrage Bot System")
@@ -135,6 +202,24 @@ async def _run_engine(settings: Settings) -> None:
 	logging.info("⚙️ Starting arbitrage engine order book service")
 	database = DatabaseManager(settings.database.url)
 	database.initialize_schema()
+	session_store = SessionStore(database)
+	session_onboarding = SessionOnboarding(
+		api_id=settings.telegram.api_id,
+		api_hash=settings.telegram.api_hash,
+		session_store=session_store,
+	)
+	session_configs = {
+		"source": {
+			"session_key": settings.source_bot.session_key,
+			"phone_number": settings.source_bot.phone_number,
+			"phone_password": settings.source_bot.phone_password,
+		},
+		"destination": {
+			"session_key": settings.destination_bot.session_key,
+			"phone_number": settings.destination_bot.phone_number,
+			"phone_password": settings.destination_bot.phone_password,
+		},
+	}
 
 	redis_manager = _build_redis_manager(settings)
 	order_book = OrderBook()
@@ -213,11 +298,43 @@ async def _run_engine(settings: Settings) -> None:
 	admin_service.register_shutdown_callback(manager.stop)
 	admin_service.register_shutdown_callback(results_processor.stop)
 
+	admin_bot_controller = None
+	if settings.admin_bot.enabled and settings.admin_bot.bot_token and settings.admin_bot.chat_id is not None:
+		admin_bot_controller = AdminControlBot(
+			redis_manager=redis_manager,
+			api_id=settings.telegram.api_id,
+			api_hash=settings.telegram.api_hash,
+			bot_token=settings.admin_bot.bot_token,
+			chat_id=settings.admin_bot.chat_id,
+			policy_snapshot=policy.snapshot,
+			initial_auto_delay=settings.source_bot.cancel_ack_delay_seconds,
+			status_refresh_seconds=settings.admin_bot.status_refresh_seconds,
+			source_alias=settings.source_bot.alias,
+			destination_alias=settings.destination_bot.alias,
+			engine_config={
+				"predictive_price_delta": settings.engine.predictive_price_delta,
+				"predictive_suffix_digits": settings.engine.predictive_suffix_digits,
+				"speculative_trade_timeout_seconds": settings.engine.speculative_trade_timeout_seconds,
+				"source_order_expiry_seconds": settings.engine.source_order_expiry_seconds,
+				"exit_break_even_timeout_seconds": settings.engine.exit_break_even_timeout_seconds,
+				"exit_stop_loss_timeout_seconds": settings.engine.exit_stop_loss_timeout_seconds,
+				"stop_loss_price_offset": settings.engine.stop_loss_price_offset,
+				"circuit_breaker_pause_seconds": settings.engine.circuit_breaker_pause_seconds,
+			},
+			initial_monitor_only=engine_state.monitor_only,
+			session_store=session_store,
+			session_onboarding=session_onboarding,
+			session_configs=session_configs,
+		)
+		admin_service.register_shutdown_callback(admin_bot_controller.stop)
+
 	tasks = [
 		manager.run(),
 		results_processor.run(),
 		admin_service.run(),
 	]
+	if admin_bot_controller is not None:
+		tasks.append(admin_bot_controller.run())
 
 	try:
 		await asyncio.gather(*tasks)
@@ -225,11 +342,15 @@ async def _run_engine(settings: Settings) -> None:
 		manager.stop()
 		results_processor.stop()
 		admin_service.stop()
+		if admin_bot_controller is not None:
+			await admin_bot_controller.stop()
 		raise
 	except Exception:
 		manager.stop()
 		results_processor.stop()
 		admin_service.stop()
+		if admin_bot_controller is not None:
+			await admin_bot_controller.stop()
 		raise
 
 
@@ -240,6 +361,24 @@ async def _run_admin(settings: Settings) -> None:
 	database = DatabaseManager(settings.database.url)
 	database.initialize_schema()
 	redis_manager = _build_redis_manager(settings)
+	session_store = SessionStore(database)
+	session_onboarding = SessionOnboarding(
+		api_id=settings.telegram.api_id,
+		api_hash=settings.telegram.api_hash,
+		session_store=session_store,
+	)
+	session_configs = {
+		"source": {
+			"session_key": settings.source_bot.session_key,
+			"phone_number": settings.source_bot.phone_number,
+			"phone_password": settings.source_bot.phone_password,
+		},
+		"destination": {
+			"session_key": settings.destination_bot.session_key,
+			"phone_number": settings.destination_bot.phone_number,
+			"phone_password": settings.destination_bot.phone_password,
+		},
+	}
 	policy = TradePolicy(
 		fixed_spread_delta=settings.engine.fixed_spread_delta,
 		base_carry_limit=settings.engine.base_carry_limit,
@@ -268,6 +407,9 @@ async def _run_admin(settings: Settings) -> None:
 			"circuit_breaker_pause_seconds": settings.engine.circuit_breaker_pause_seconds,
 		},
 		initial_monitor_only=False,
+		session_store=session_store,
+		session_onboarding=session_onboarding,
+		session_configs=session_configs,
 	)
 
 	try:
@@ -348,6 +490,7 @@ def _parse_args() -> argparse.Namespace:
 
 	subparsers.add_parser("run", help="Start both Telegram agents (default)")
 	subparsers.add_parser("engine", help="Run the arbitrage engine order book service")
+	subparsers.add_parser("ensure-sessions", help="Ensure Telegram sessions exist before deployment")
 	subparsers.add_parser("admin", help="Run the admin control bot")
 
 	agent_parser = subparsers.add_parser("agent", help="Run a single Telegram agent")
@@ -392,6 +535,8 @@ async def _async_entrypoint(args: argparse.Namespace) -> None:
 		await _run_agent(settings, args.name)
 	elif args.command == "admin":
 		await _run_admin(settings)
+	elif args.command == "ensure-sessions":
+		await _ensure_sessions(settings)
 	elif args.command == "publish":
 		await _publish_command(settings, args.json, args.channel)
 	elif args.command == "listen":

@@ -12,14 +12,14 @@ def _load_env_file(env_path: str | Path) -> None:
 
     for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if "=" not in stripped:
-                continue
-            key, value = stripped.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            os.environ.setdefault(key, value)
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
 
 
 _BOOL_TRUE = {"1", "true", "t", "yes", "y", "on"}

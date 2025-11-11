@@ -75,8 +75,39 @@ def _migration_session_store(cursor: Cursor) -> None:
         CREATE TABLE IF NOT EXISTS telethon_sessions (
             session_name TEXT PRIMARY KEY,
             session_data TEXT NOT NULL,
-            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            phone_number TEXT,
+            bot_role TEXT,
+            flood_wait_until TIMESTAMPTZ,
+            last_error TEXT
         )
+        """
+    )
+
+
+def _migration_session_metadata(cursor: Cursor) -> None:
+    cursor.execute(
+        """
+        ALTER TABLE telethon_sessions
+        ADD COLUMN IF NOT EXISTS phone_number TEXT
+        """
+    )
+    cursor.execute(
+        """
+        ALTER TABLE telethon_sessions
+        ADD COLUMN IF NOT EXISTS bot_role TEXT
+        """
+    )
+    cursor.execute(
+        """
+        ALTER TABLE telethon_sessions
+        ADD COLUMN IF NOT EXISTS flood_wait_until TIMESTAMPTZ
+        """
+    )
+    cursor.execute(
+        """
+        ALTER TABLE telethon_sessions
+        ADD COLUMN IF NOT EXISTS last_error TEXT
         """
     )
 
@@ -84,6 +115,7 @@ def _migration_session_store(cursor: Cursor) -> None:
 _MIGRATIONS: Iterable[Migration] = (
     Migration("0001_initial_schema", _migration_initial_schema),
     Migration("0002_session_store", _migration_session_store),
+    Migration("0003_session_metadata", _migration_session_metadata),
 )
 
 

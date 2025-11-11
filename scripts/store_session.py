@@ -5,68 +5,17 @@ from __future__ import annotations
 import asyncio
 import getpass
 import sys
+from pathlib import Path
 from typing import Optional
 
-from pathlib import Path
-
-from telethon import TelegramClient
-from telethon.errors import PhoneCodeInvalidError, PhoneCodeExpiredError, SessionPasswordNeededError
-from telethon.sessions import StringSession
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.common.db import DatabaseManager
+from src.common.session_onboarding import OnboardingConfig, SessionOnboarding
 from src.common.session_store import SessionStore
 from src.config.settings import get_settings
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
-async def interactive_login(
-    *,
-    api_id: int,
-    api_hash: str,
-    phone_number: str,
-    phone_password: Optional[str],
-) -> str:
-    """Drive a Telethon login flow and return the resulting session string."""
-    print(f"🤖 در حال ورود برای شماره: {phone_number}")
-    client = TelegramClient(StringSession(), api_id, api_hash)
-    await client.connect()
-
-    try:
-        if await client.is_user_authorized():
-            print("ℹ️ جلسه قبلاً مجاز بود؛ نیازی به دریافت کد نیست.")
-        else:
-            send_code_result = await client.send_code_request(phone_number)
-            print("📨 کد ورود برای ربات ارسال شد. لطفاً آن را وارد کنید.")
-            if send_code_result.next_type is not None:
-                print(f"⚠️ ارسال کد به صورت {send_code_result.next_type.__class__.__name__} است.")
-
-            while True:
-                code = input("کد ورود را وارد کن: ").strip().replace(" ", "")
-                if not code:
-                    print("کد نمی‌تواند خالی باشد. دوباره تلاش کن.")
-                    continue
-                try:
-                    await client.sign_in(phone=phone_number, code=code)
-                    break
-                except PhoneCodeInvalidError:
-                    print("❌ کد وارد شده اشتباه بود. دوباره ارسال کن.")
-                except PhoneCodeExpiredError:
-                    print("⌛ کد منقضی شده. دوباره تلاش می‌کنیم.")
-                    send_code_result = await client.send_code_request(phone_number)
-        if not await client.is_user_authorized():
-            try:
-                await client.start(phone=phone_number, password=phone_password)
-            except SessionPasswordNeededError:
-                if not phone_password:
-                    password = getpass.getpass("گذرواژه دو مرحله‌ای تلگرام را وارد کن: ")
-                else:
-                    password = phone_password
-                await client.start(phone=phone_number, password=password)
-    finally:
-        session_string = client.session.save()
-        await client.disconnect()
-    return session_string
 
 
 def resolve_session_key(name_hint: str) -> str:
@@ -106,16 +55,45 @@ async def main() -> None:
         print("❌ شماره ربات لازم است. فرآیند متوقف شد.")
         sys.exit(1)
 
-    session_string = await interactive_login(
+    database = DatabaseManager(settings.database.url)
+    database.initialize_schema()
+    store = SessionStore(database)
+    onboarding = SessionOnboarding(
         api_id=settings.telegram.api_id,
         api_hash=settings.telegram.api_hash,
+        session_store=store,
+    )
+
+    config = OnboardingConfig(
+        session_key=session_key,
+        bot_role="source" if session_key.startswith("source") else "destination" if session_key.startswith("destination") else session_key,
         phone_number=phone_number,
         phone_password=phone_password,
     )
+    print(f"🤖 شروع فرآیند ورود برای {config.bot_role} ({phone_number})")
 
-    database = DatabaseManager(settings.database.url)
-    database.initialize_schema()
-    SessionStore(database).save(session_key, session_string)
+    async def prompt_code(role: str, phone: str) -> str:
+        code = input(f"کد ارسال‌شده برای {role} ({phone}) را وارد کن: ").strip().replace(" ", "")
+        return code
+
+    async def prompt_password(role: str) -> Optional[str]:
+        password = getpass.getpass("گذرواژه دو مرحله‌ای (در صورت وجود) را وارد کن: ")
+        return password or None
+
+    async def notify_flood(role: str, seconds: int) -> None:
+        if seconds <= 0:
+            print("❌ کد اشتباه بود. دوباره تلاش کن.")
+        else:
+            minutes = seconds // 60
+            remaining = seconds % 60
+            print(f"⏳ FloodWait برای {role}: لطفاً {minutes} دقیقه و {remaining} ثانیه منتظر بمان و سپس دوباره تلاش کن.")
+
+    await onboarding.ensure_session(
+        config,
+        prompt_code=prompt_code,
+        prompt_password=prompt_password,
+        notify_flood_wait=notify_flood,
+    )
     print(f"🎉 جلسه با موفقیت برای کلید {session_key} ذخیره شد.")
 
 

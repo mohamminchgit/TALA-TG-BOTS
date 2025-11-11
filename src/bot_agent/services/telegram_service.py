@@ -59,7 +59,13 @@ class TelegramService:
     async def _persist_session(self) -> None:
         session_data = self._client.session.save()
         if session_data:
-            await asyncio.to_thread(self._session_store.save, self._session_key, session_data)
+            await asyncio.to_thread(
+                self._session_store.save,
+                self._session_key,
+                session_data,
+                phone_number=None,
+                bot_role=None,
+            )
 
     def add_message_handler(
         self,

@@ -51,11 +51,13 @@ mkdir -p $RemotePath && \
 tar -xzf /tmp/$archiveName -C $RemotePath --strip-components=1 && \
 cd $RemotePath && \
 bash deployment/merge-env.sh . && \
-cd deployment && \
-docker compose pull postgres redis || true && \
-docker compose up -d --build && \
+python3 -m pip install --user -r requirements.txt && \
+docker compose -f deployment/docker-compose.yml pull postgres redis || true && \
+docker compose -f deployment/docker-compose.yml up -d postgres redis && \
+python3 main.py ensure-sessions && \
+docker compose -f deployment/docker-compose.yml up -d --build && \
 rm /tmp/$archiveName
 "@
-& ssh "$User@$targetHost" $remoteCommand
+& ssh -t "$User@$targetHost" $remoteCommand
 
 Remove-Item $archivePath -Force
