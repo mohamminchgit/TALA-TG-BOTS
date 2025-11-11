@@ -3,12 +3,14 @@ import asyncio
 import json
 import logging
 import sys
+import uuid
 from typing import Iterable, Optional
 
 from src.admin_bot import AdminControlBot
 from src.bot_agent.agent import BotAgent
 from src.common.db import DatabaseManager
 from src.common.redis import RedisChannels, RedisManager
+from src.common.session_store import SessionStore
 from src.config.settings import Settings, get_settings
 from src.engine.core.engine_state import EngineState
 from src.engine.core.order_book import OrderBook
@@ -43,10 +45,18 @@ async def _launch_agent(agent: BotAgent) -> None:
 async def _monitor_results(redis_manager: RedisManager, channel: str) -> None:
 	"""Monitor execution_results channel and print formatted output"""
 	logging.info("📊 Monitoring execution results...")
+	group_name = "execution_results_cli"
+	consumer_name = f"cli-monitor-{uuid.uuid4().hex}"
 	try:
-		async for message in redis_manager.subscribe(channel):
+		async for message in redis_manager.consume_stream(
+			channel,
+			group_name,
+			consumer_name,
+			count=50,
+			delete_on_ack=False,
+		):
 			try:
-				result = json.loads(message)
+				result = message.payload
 				status_emoji = "✅" if result.get("status") == "success" else "❌"
 				print(f"\n{status_emoji} EXECUTION RESULT:")
 				print(f"   Agent: {result.get('alias', 'N/A')}")
@@ -55,8 +65,9 @@ async def _monitor_results(redis_manager: RedisManager, channel: str) -> None:
 				if result.get("details"):
 					print(f"   Details: {json.dumps(result['details'], ensure_ascii=False)}")
 				print("-" * 60)
+				await message.ack()
 			except json.JSONDecodeError:
-				logging.warning("Failed to decode result: %s", message)
+				logging.warning("Failed to decode result: %s", message.payload)
 	except asyncio.CancelledError:
 		logging.info("Result monitoring stopped")
 
@@ -66,17 +77,20 @@ async def _run_agents(settings: Settings) -> None:
 	logging.info("=" * 60)
 	
 	# Initialize database
-	DatabaseManager(settings.database.path).initialize_schema()
+	database = DatabaseManager(settings.database.url)
+	database.initialize_schema()
 	logging.info("✓ Database initialized")
 
 	# Setup Redis
 	redis_manager = _build_redis_manager(settings)
 	logging.info("✓ Redis connection ready")
 
+	session_store = SessionStore(database)
+
 	# Create agents
 	agents: Iterable[BotAgent] = (
-		BotAgent("source", settings.source_bot, settings.telegram, redis_manager),
-		BotAgent("destination", settings.destination_bot, settings.telegram, redis_manager),
+		BotAgent("source", settings.source_bot, settings.telegram, redis_manager, session_store),
+		BotAgent("destination", settings.destination_bot, settings.telegram, redis_manager, session_store),
 	)
 	logging.info("✓ Bot agents created")
 	logging.info("=" * 60)
@@ -100,9 +114,26 @@ async def _run_agents(settings: Settings) -> None:
 			pass
 
 
+async def _run_agent(settings: Settings, name: str) -> None:
+	logging.info("🚀 Starting %s agent", name)
+	database = DatabaseManager(settings.database.url)
+	database.initialize_schema()
+	redis_manager = _build_redis_manager(settings)
+	session_store = SessionStore(database)
+	if name == "source":
+		config = settings.source_bot
+	elif name == "destination":
+		config = settings.destination_bot
+	else:
+		raise RuntimeError(f"Unknown agent name: {name}")
+	agent = BotAgent(name, config, settings.telegram, redis_manager, session_store)
+	await agent.start()
+	await agent.run()
+
+
 async def _run_engine(settings: Settings) -> None:
 	logging.info("⚙️ Starting arbitrage engine order book service")
-	database = DatabaseManager(settings.database.path)
+	database = DatabaseManager(settings.database.url)
 	database.initialize_schema()
 
 	redis_manager = _build_redis_manager(settings)
@@ -181,40 +212,12 @@ async def _run_engine(settings: Settings) -> None:
 	)
 	admin_service.register_shutdown_callback(manager.stop)
 	admin_service.register_shutdown_callback(results_processor.stop)
-	admin_bot_controller = None
-	if settings.admin_bot.enabled and settings.admin_bot.bot_token and settings.admin_bot.chat_id is not None:
-		admin_bot_controller = AdminControlBot(
-			redis_manager=redis_manager,
-			api_id=settings.telegram.api_id,
-			api_hash=settings.telegram.api_hash,
-			bot_token=settings.admin_bot.bot_token,
-			chat_id=settings.admin_bot.chat_id,
-			policy_snapshot=policy.snapshot,
-			initial_auto_delay=settings.source_bot.cancel_ack_delay_seconds,
-			status_refresh_seconds=settings.admin_bot.status_refresh_seconds,
-			source_alias=settings.source_bot.alias,
-			destination_alias=settings.destination_bot.alias,
-			engine_config={
-				"predictive_price_delta": settings.engine.predictive_price_delta,
-				"predictive_suffix_digits": settings.engine.predictive_suffix_digits,
-				"speculative_trade_timeout_seconds": settings.engine.speculative_trade_timeout_seconds,
-				"source_order_expiry_seconds": settings.engine.source_order_expiry_seconds,
-				"exit_break_even_timeout_seconds": settings.engine.exit_break_even_timeout_seconds,
-				"exit_stop_loss_timeout_seconds": settings.engine.exit_stop_loss_timeout_seconds,
-				"stop_loss_price_offset": settings.engine.stop_loss_price_offset,
-				"circuit_breaker_pause_seconds": settings.engine.circuit_breaker_pause_seconds,
-			},
-			initial_monitor_only=engine_state.monitor_only,
-		)
-		admin_service.register_shutdown_callback(admin_bot_controller.stop)
 
 	tasks = [
 		manager.run(),
 		results_processor.run(),
 		admin_service.run(),
 	]
-	if admin_bot_controller is not None:
-		tasks.append(admin_bot_controller.run())
 
 	try:
 		await asyncio.gather(*tasks)
@@ -222,15 +225,58 @@ async def _run_engine(settings: Settings) -> None:
 		manager.stop()
 		results_processor.stop()
 		admin_service.stop()
-		if admin_bot_controller is not None:
-			await admin_bot_controller.stop()
 		raise
 	except Exception:
 		manager.stop()
 		results_processor.stop()
 		admin_service.stop()
-		if admin_bot_controller is not None:
-			await admin_bot_controller.stop()
+		raise
+
+
+async def _run_admin(settings: Settings) -> None:
+	if not (settings.admin_bot.enabled and settings.admin_bot.bot_token and settings.admin_bot.chat_id is not None):
+		raise RuntimeError("Admin bot is not configured. Set ADMIN_BOT_TOKEN and ADMIN_BOT_CHAT_ID.")
+
+	database = DatabaseManager(settings.database.url)
+	database.initialize_schema()
+	redis_manager = _build_redis_manager(settings)
+	policy = TradePolicy(
+		fixed_spread_delta=settings.engine.fixed_spread_delta,
+		base_carry_limit=settings.engine.base_carry_limit,
+		opportunity_carry_limit=settings.engine.opportunity_carry_limit,
+	)
+
+	controller = AdminControlBot(
+		redis_manager=redis_manager,
+		api_id=settings.telegram.api_id,
+		api_hash=settings.telegram.api_hash,
+		bot_token=settings.admin_bot.bot_token,
+		chat_id=settings.admin_bot.chat_id,
+		policy_snapshot=policy.snapshot,
+		initial_auto_delay=settings.source_bot.cancel_ack_delay_seconds,
+		status_refresh_seconds=settings.admin_bot.status_refresh_seconds,
+		source_alias=settings.source_bot.alias,
+		destination_alias=settings.destination_bot.alias,
+		engine_config={
+			"predictive_price_delta": settings.engine.predictive_price_delta,
+			"predictive_suffix_digits": settings.engine.predictive_suffix_digits,
+			"speculative_trade_timeout_seconds": settings.engine.speculative_trade_timeout_seconds,
+			"source_order_expiry_seconds": settings.engine.source_order_expiry_seconds,
+			"exit_break_even_timeout_seconds": settings.engine.exit_break_even_timeout_seconds,
+			"exit_stop_loss_timeout_seconds": settings.engine.exit_stop_loss_timeout_seconds,
+			"stop_loss_price_offset": settings.engine.stop_loss_price_offset,
+			"circuit_breaker_pause_seconds": settings.engine.circuit_breaker_pause_seconds,
+		},
+		initial_monitor_only=False,
+	)
+
+	try:
+		await controller.run()
+	except asyncio.CancelledError:
+		await controller.stop()
+		raise
+	except Exception:
+		await controller.stop()
 		raise
 
 
@@ -246,6 +292,10 @@ async def _publish_command(settings: Settings, json_payload: str, channel_alias:
 		"admin_reports": channels.admin_reports_channel,
 	}
 	channel = channel_map.get(channel_alias, channel_alias)
+
+	if channel_alias == "execution_commands":
+		target = payload.get("target_bot") or "broadcast"
+		channel = f"{channel}:{target}"
 
 	await redis_manager.publish_json(channel, payload)
 	logging.info("Published payload to %s: %s", channel_alias, payload)
@@ -263,14 +313,23 @@ async def _listen_channel(settings: Settings, channel_alias: str) -> None:
 	}
 	channel = channel_map.get(channel_alias, channel_alias)
 
-	logging.info("Listening on channel %s (%s) — press Ctrl+C to stop", channel_alias, channel)
+	group_name = f"listen-{channel_alias}"
+	consumer_name = f"cli-listener-{uuid.uuid4().hex}"
+
+	logging.info("Listening on stream %s (%s) — press Ctrl+C to stop", channel_alias, channel)
 	try:
-		async for message in redis_manager.subscribe(channel):
-			try:
-				parsed = json.loads(message)
-				print(json.dumps(parsed, ensure_ascii=False, indent=2))
-			except json.JSONDecodeError:
-				print(message)
+		async for message in redis_manager.consume_stream(
+			channel,
+			group_name,
+			consumer_name,
+			delete_on_ack=False,
+		):
+			payload = message.payload
+			if isinstance(payload, dict):
+				print(json.dumps(payload, ensure_ascii=False, indent=2))
+			else:
+				print(payload)
+			await message.ack()
 	except KeyboardInterrupt:
 		logging.info("Stopped listening to %s", channel_alias)
 
@@ -289,6 +348,15 @@ def _parse_args() -> argparse.Namespace:
 
 	subparsers.add_parser("run", help="Start both Telegram agents (default)")
 	subparsers.add_parser("engine", help="Run the arbitrage engine order book service")
+	subparsers.add_parser("admin", help="Run the admin control bot")
+
+	agent_parser = subparsers.add_parser("agent", help="Run a single Telegram agent")
+	agent_parser.add_argument(
+		"--name",
+		required=True,
+		choices=("source", "destination"),
+		help="Agent role to run",
+	)
 
 	publish_parser = subparsers.add_parser(
 		"publish", help="Publish a raw JSON payload to a Redis channel (default: execution_commands)"
@@ -320,6 +388,10 @@ async def _async_entrypoint(args: argparse.Namespace) -> None:
 		await _run_agents(settings)
 	elif args.command == "engine":
 		await _run_engine(settings)
+	elif args.command == "agent":
+		await _run_agent(settings, args.name)
+	elif args.command == "admin":
+		await _run_admin(settings)
 	elif args.command == "publish":
 		await _publish_command(settings, args.json, args.channel)
 	elif args.command == "listen":

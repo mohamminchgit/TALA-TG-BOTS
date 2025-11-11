@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from src.common.redis import RedisManager
+from src.common.redis import RedisManager, StreamMessage
 from src.engine.core.order_book import OrderBook
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,8 @@ class OrderBookManager:
         self._tasks: list[asyncio.Task] = []
         self._event_listeners: List[Callable[[Dict[str, Any]], Awaitable[None] | None]] = event_listeners or []
         self._executed_cache_key = executed_trades_cache_key
+        self._group_name = "order_book"
+        self._consumer_name = f"order-book-{uuid.uuid4().hex}"
 
     async def run(self) -> None:
         """Run the consumer and reconciliation loops until cancelled."""
@@ -60,21 +62,29 @@ class OrderBookManager:
         self._tasks.clear()
 
     async def _consume_group_events(self) -> None:
-        logger.info("Subscribing to %s for order book updates", self._channel)
+        logger.info("Reading stream %s for order book updates", self._channel)
         try:
-            async for message in self._redis.subscribe(self._channel):
+            async for message in self._redis.consume_stream(
+                self._channel,
+                self._group_name,
+                self._consumer_name,
+                count=200,
+            ):
                 if self._stop_event.is_set():
                     break
-                payload = self._parse_payload(message)
-                if payload is None:
-                    continue
-                if await self._should_skip_event(payload):
-                    continue
-                self._order_book.apply_event(payload)
-                await self._notify_listeners(payload)
+                await self._handle_stream_message(message)
         except asyncio.CancelledError:
             logger.debug("Order book consumer cancelled")
             raise
+
+    async def _handle_stream_message(self, message: StreamMessage) -> None:
+        payload = message.payload
+        if await self._should_skip_event(payload):
+            await message.ack()
+            return
+        self._order_book.apply_event(payload)
+        await self._notify_listeners(payload)
+        await message.ack()
 
     async def _reconciliation_loop(self) -> None:
         logger.info(
@@ -97,19 +107,6 @@ class OrderBookManager:
         except asyncio.CancelledError:
             logger.debug("Reconciliation loop cancelled")
             raise
-
-    @staticmethod
-    def _parse_payload(message: Any) -> Dict[str, Any] | None:
-        if isinstance(message, (bytes, bytearray)):
-            message = message.decode("utf-8", errors="ignore")
-        if not isinstance(message, str):
-            logger.warning("Unsupported message type on group_events: %s", type(message))
-            return None
-        try:
-            return json.loads(message)
-        except json.JSONDecodeError:
-            logger.warning("Failed to decode group_events payload: %s", message)
-            return None
 
     def snapshot(self) -> Dict[str, Dict[int, Dict[str, Any]]]:
         """Return a copy of the current order book for inspection."""

@@ -13,6 +13,7 @@ from src.bot_agent.services.command_executor import CommandContext, CommandExecu
 from src.bot_agent.services.confirmation_monitor import ConfirmationMonitor
 from src.config.settings import BotConfig, TelegramCredentials
 from src.common.redis import RedisManager
+from src.common.session_store import SessionStore
 from src.common.utils import normalize_persian_numbers, utc_now
 
 logger = logging.getLogger(__name__)
@@ -34,18 +35,20 @@ class BotAgent:
         config: BotConfig,
         credentials: TelegramCredentials,
         redis_manager: RedisManager,
+        session_store: SessionStore,
     ) -> None:
         self.name = name
         self.config = config
         self.alias = config.alias
         self._credentials = credentials
-        self._telegram = TelegramService(config.session_path, credentials.api_id, credentials.api_hash)
+        self._telegram = TelegramService(session_store, config.session_key, credentials.api_id, credentials.api_hash)
         self._group_filter = self._coerce_group_id(config.group_id)
         self._ready_event = asyncio.Event()
         self._redis = redis_manager
         self._command_executor: Optional[CommandExecutor] = None
         self._confirmation_monitor = ConfirmationMonitor(self, config.confirmation_timeout_seconds)
         self._cancel_ack_delay_seconds = max(0, config.cancel_ack_delay_seconds)
+        self._alias_normalized = normalize_persian_numbers(self.alias).strip().lower()
 
     @staticmethod
     def _coerce_group_id(raw_value: str) -> Any:
@@ -122,6 +125,7 @@ class BotAgent:
         if not display_name_raw:
             display_name_raw = "Unknown"
 
+        details_dict = dict(classification.details or {})
         payload = {
             "agent": self.name,
             "alias": self.alias,
@@ -130,7 +134,7 @@ class BotAgent:
             "category": classification.category,
             "text": classification.original_text,
             "normalized_text": classification.normalized_text,
-            "details": classification.details or {},
+            "details": details_dict,
             "message": {
                 "id": getattr(message, "id", None),
                 "chat_id": event.chat_id,
@@ -143,6 +147,15 @@ class BotAgent:
                 "display_name": normalize_persian_numbers(display_name_raw),
             },
         }
+
+        classification.details = details_dict
+
+        alias_value = details_dict.get("alias")
+        if alias_value:
+            alias_normalized = normalize_persian_numbers(alias_value).strip().lower()
+            details_dict.setdefault("alias_normalized", alias_normalized)
+            if alias_normalized == self._alias_normalized and classification.category in {"buy_order", "sell_order"}:
+                details_dict["is_self_order_confirmation"] = True
 
         await self._redis.publish_json(self._redis.channels.group_events, payload)
         logger.info(

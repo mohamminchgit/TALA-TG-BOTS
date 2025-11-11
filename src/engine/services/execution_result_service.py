@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from src.common.db import DatabaseManager
-from src.common.redis import RedisManager
+from src.common.redis import RedisManager, StreamMessage
 from src.engine.core.trade_tracker import TradeContext, TradeTracker
 
 logger = logging.getLogger(__name__)
@@ -35,36 +35,32 @@ class ExecutionResultProcessor:
         self._stop_event = asyncio.Event()
         self._listeners = listeners or []
         self._trade_observer = trade_observer
+        self._group_name = "execution_results"
+        self._consumer_name = f"exec-results-{uuid.uuid4().hex}"
 
     def stop(self) -> None:
         self._stop_event.set()
 
     async def run(self) -> None:
-        logger.info("Subscribing to %s for execution results", self._channel)
+        logger.info("Reading stream %s for execution results", self._channel)
         try:
-            async for message in self._redis.subscribe(self._channel):
+            async for message in self._redis.consume_stream(
+                self._channel,
+                self._group_name,
+                self._consumer_name,
+                count=200,
+            ):
                 if self._stop_event.is_set():
                     break
-                payload = self._parse_payload(message)
-                if payload is None:
-                    continue
-                await self._handle_result(payload)
+                await self._handle_stream_message(message)
         except asyncio.CancelledError:
             logger.debug("Execution result processor cancelled")
             raise
 
-    @staticmethod
-    def _parse_payload(message: Any) -> Optional[Dict[str, Any]]:
-        if isinstance(message, (bytes, bytearray)):
-            message = message.decode("utf-8", errors="ignore")
-        if not isinstance(message, str):
-            logger.warning("Unsupported message type on execution_results: %s", type(message))
-            return None
-        try:
-            return json.loads(message)
-        except json.JSONDecodeError:
-            logger.warning("Failed to decode execution_results payload: %s", message)
-            return None
+    async def _handle_stream_message(self, message: StreamMessage) -> None:
+        payload = message.payload
+        await self._handle_result(payload)
+        await message.ack()
 
     async def _handle_result(self, payload: Dict[str, Any]) -> None:
         for listener in self._listeners:
@@ -175,28 +171,29 @@ class ExecutionResultProcessor:
         )
 
         with self._database.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO trade_history (
-                    trade_id,
-                    strategy,
-                    source_message_id,
-                    destination_message_id,
-                    quantity,
-                    source_price,
-                    destination_price,
-                    profit,
-                    status
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO trade_history (
+                        trade_id,
+                        strategy,
+                        source_message_id,
+                        destination_message_id,
+                        quantity,
+                        source_price,
+                        destination_price,
+                        profit,
+                        status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (trade_id) DO UPDATE SET
+                        quantity = EXCLUDED.quantity,
+                        source_price = EXCLUDED.source_price,
+                        destination_price = EXCLUDED.destination_price,
+                        profit = EXCLUDED.profit,
+                        status = EXCLUDED.status,
+                        executed_at = CURRENT_TIMESTAMP
+                    """,
+                    payload,
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(trade_id) DO UPDATE SET
-                    quantity=excluded.quantity,
-                    source_price=excluded.source_price,
-                    destination_price=excluded.destination_price,
-                    profit=excluded.profit,
-                    status=excluded.status,
-                    executed_at=CURRENT_TIMESTAMP
-                """,
-                payload,
-            )
-            conn.commit()
+                conn.commit()

@@ -410,7 +410,7 @@ class RiskManager:
         if quantity is not None:
             payload["quantity"] = quantity
 
-        await self._redis.publish_json(self._commands_channel, payload)
+        await self._publish_command(payload)
         logger.info("RiskManager issued %s command for trade %s (stage=%s)", action, trade_id, stage)
 
     async def _publish_admin_report(self, event: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
@@ -430,4 +430,9 @@ class RiskManager:
         alias = alias.strip() or "ربات"
         if side == "sell":
             return f"🔴 {alias} {quantity} ف {price}"
+
+    async def _publish_command(self, payload: Dict[str, Any]) -> None:
+        target = payload.get("target_bot") or "broadcast"
+        stream = f"{self._commands_channel}:{target}"
+        await self._redis.publish_json(stream, payload, maxlen=1000)
         return f"🔵 {alias} {quantity} خ {price}"

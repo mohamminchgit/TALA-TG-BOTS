@@ -45,6 +45,18 @@ def _normalize_alias(value: Optional[str]) -> str:
     return normalize_persian_numbers(value).strip().lower()
 
 
+def _parse_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    text = normalize_persian_numbers(str(value)).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
 class PredictiveMarketMaker:
     """Places speculative orders when immediate arbitrage is unavailable."""
 
@@ -70,6 +82,7 @@ class PredictiveMarketMaker:
         self._suffix_digits = max(1, predictive_suffix_digits)
         self._timeout_seconds = max(1, speculative_timeout_seconds)
         self._destination_alias = destination_alias.strip() or "ربات مقصد"
+        self._destination_alias_normalized = _normalize_alias(self._destination_alias)
         self._policy = policy
         # Retain predictive_price_delta for backward compatibility with admin commands.
         self._price_delta_override = max(0, predictive_price_delta)
@@ -83,6 +96,10 @@ class PredictiveMarketMaker:
 
         group_label = event.get("group_label")
         category = event.get("category")
+
+        if group_label == "destination" and category in {"buy_order", "sell_order"}:
+            if await self._handle_destination_confirmation(event):
+                return
 
         if group_label == "source" and category == "cancel_all":
             message_meta = event.get("message") or {}
@@ -178,7 +195,7 @@ class PredictiveMarketMaker:
         if not pending or not command_payload:
             return
 
-        await self._redis.publish_json(self._commands_channel, command_payload)
+        await self._publish_command(command_payload)
         logger.info(
             "Issued predictive trade %s for source message %s (direction=%s price=%s)",
             pending.trade_id,
@@ -253,19 +270,7 @@ class PredictiveMarketMaker:
             except (TypeError, ValueError):
                 logger.debug("Unable to coerce confirmation message id %s", confirmation_message_id)
 
-        if not pending.context_registered:
-            context = TradeContext(
-                trade_id=pending.trade_id,
-                source_message_id=pending.source_message_id,
-                destination_message_id=pending.destination_message_id or 0,
-                quantity=pending.quantity,
-                source_price=pending.source_price,
-                destination_price=pending.destination_price,
-                spread=pending.expected_spread,
-                strategy="predictive",
-            )
-            self._tracker.register(context)
-            pending.context_registered = True
+        self._ensure_trade_context(pending)
 
         pending.stage = "awaiting_source_execution"
         await self._save_state(pending)
@@ -283,7 +288,7 @@ class PredictiveMarketMaker:
                 "policy_delta": self._policy.snapshot.fixed_spread_delta,
             },
         }
-        await self._redis.publish_json(self._commands_channel, command_payload)
+        await self._publish_command(command_payload)
         logger.info(
             "Predictive trade %s filled in destination; closing source leg",
             pending.trade_id,
@@ -325,7 +330,7 @@ class PredictiveMarketMaker:
                 "trade_id": pending.trade_id,
                 "metadata": metadata,
             }
-            await self._redis.publish_json(self._commands_channel, cancel_payload)
+            await self._publish_command(cancel_payload)
             logger.info(
                 "Predictive trade %s cancelled (%s)",
                 pending.trade_id,
@@ -347,6 +352,27 @@ class PredictiveMarketMaker:
             return
         pending.timeout_task = self._create_timeout_task(pending)
 
+    def _ensure_trade_context(self, pending: PendingPredictiveTrade) -> None:
+        if pending.context_registered:
+            return
+        context = TradeContext(
+            trade_id=pending.trade_id,
+            source_message_id=pending.source_message_id,
+            destination_message_id=pending.destination_message_id or 0,
+            quantity=pending.quantity,
+            source_price=pending.source_price,
+            destination_price=pending.destination_price,
+            spread=pending.expected_spread,
+            strategy="predictive",
+        )
+        self._tracker.register(context)
+        pending.context_registered = True
+
+    async def _publish_command(self, payload: Dict[str, Any]) -> None:
+        target = payload.get("target_bot") or "broadcast"
+        stream = f"{self._commands_channel}:{target}"
+        await self._redis.publish_json(stream, payload, maxlen=1000)
+
     async def _save_state(self, pending: PendingPredictiveTrade) -> None:
         state = {
             "trade_id": pending.trade_id,
@@ -356,6 +382,7 @@ class PredictiveMarketMaker:
             "quantity": pending.quantity,
             "direction": pending.direction,
             "destination_message_id": pending.destination_message_id,
+            "destination_supervisor_message_id": pending.destination_supervisor_message_id,
             "stage": pending.stage,
             "expected_spread": pending.expected_spread,
             "updated_at": time.time(),
@@ -458,6 +485,68 @@ class PredictiveMarketMaker:
             await self._cancel_pending_trade(pending, reason="timeout")
 
         return asyncio.create_task(_expire(), name=f"pred-source-expiry-{pending.trade_id}")
+
+    async def _handle_destination_confirmation(self, event: Dict[str, Any]) -> bool:
+        message = event.get("message") or {}
+        message_id_raw = message.get("id")
+        if message_id_raw is None:
+            return False
+        try:
+            message_id = int(message_id_raw)
+        except (TypeError, ValueError):
+            return False
+
+        details = event.get("details") or {}
+        alias_normalized = _normalize_alias(details.get("alias"))
+        if not alias_normalized or alias_normalized != self._destination_alias_normalized:
+            return False
+
+        side = "buy" if event.get("category") == "buy_order" else "sell"
+        quantity = _parse_int(details.get("quantity"))
+        price = _parse_int(details.get("price"))
+        reply_to_raw = message.get("reply_to")
+        reply_to_id: Optional[int] = None
+        if reply_to_raw is not None:
+            try:
+                reply_to_id = int(reply_to_raw)
+            except (TypeError, ValueError):
+                reply_to_id = None
+
+        async with self._lock:
+            pending = self._match_pending_for_confirmation(side, quantity, price, reply_to_id)
+            if not pending:
+                return False
+            pending.destination_supervisor_message_id = message_id
+
+        self._ensure_trade_context(pending)
+        self._tracker.set_supervisor_message_id(pending.trade_id, "destination", message_id)
+        await self._save_state(pending)
+        logger.info("Recorded supervisor confirmation %s for trade %s", message_id, pending.trade_id)
+        return True
+
+    def _match_pending_for_confirmation(
+        self,
+        side: str,
+        quantity: Optional[int],
+        price: Optional[int],
+        reply_to_id: Optional[int],
+    ) -> Optional[PendingPredictiveTrade]:
+        for pending in self._pending.values():
+            if pending.destination_supervisor_message_id:
+                continue
+            if pending.destination_message_id is None:
+                continue
+            expected_side = "sell" if pending.direction == "source_sell" else "buy"
+            if side != expected_side:
+                continue
+            if reply_to_id is not None and pending.destination_message_id == reply_to_id:
+                return pending
+            if quantity is not None and pending.quantity != quantity:
+                continue
+            if price is not None and pending.destination_price != price:
+                continue
+            return pending
+        return None
 
     def _should_post_speculative(self, direction: TradeDirection, source_price: int, target_price: int) -> bool:
         if direction == "source_sell":

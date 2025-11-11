@@ -207,6 +207,20 @@ class TradeTracker:
             return {}
         return context.agent_details.get(agent, {})
 
+    def set_supervisor_message_id(self, trade_id: str, agent: str, message_id: int) -> None:
+        context = self._records.get(trade_id)
+        if context is None:
+            return
+        try:
+            message_id_int = int(message_id)
+        except (TypeError, ValueError):
+            return
+        context.supervisor_message_ids[agent] = message_id_int
+        if agent.startswith("destination"):
+            context.supervisor_message_ids["destination"] = message_id_int
+        elif agent.startswith("source"):
+            context.supervisor_message_ids["source"] = message_id_int
+
     def get_supervisor_message_id(self, trade_id: str, agent: str, *, fallback: bool = True) -> Optional[int]:
         context = self._records.get(trade_id)
         if context is None:

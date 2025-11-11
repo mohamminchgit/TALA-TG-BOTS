@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.common.db import DatabaseManager
-from src.common.redis import RedisChannels, RedisManager
+from src.common.redis import RedisChannels, RedisManager, StreamMessage
 from src.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -56,38 +56,49 @@ async def publish_order(redis_manager: RedisManager, order: PublishedOrder) -> N
     logger.info("Published %s order %s @ %s", order.group_label, order.message_id, order.price)
 
 
-async def capture_execution_commands(
-    redis_manager: RedisManager,
-    trade_id_timeout: float = 5.0,
-) -> List[Dict[str, Any]]:
+async def capture_execution_commands(redis_manager: RedisManager, trade_id_timeout: float = 5.0) -> List[Dict[str, Any]]:
     commands: List[Dict[str, Any]] = []
 
-    async def _listener() -> None:
-        async for message in redis_manager.subscribe(redis_manager.channels.execution_commands):
-            try:
-                payload = json.loads(message)
-            except json.JSONDecodeError:
-                logger.warning("Ignoring malformed execution command: %s", message)
-                continue
-            commands.append(payload)
-            logger.info(
-                "Captured execution command: target=%s trade_id=%s action=%s",
-                payload.get("target_bot"),
-                payload.get("trade_id"),
-                payload.get("action"),
-            )
+    async def _consume(stream: str, group: str, consumer: str) -> None:
+        async for message in redis_manager.consume_stream(stream, group, consumer, delete_on_ack=False):
+            await _handle_command_message(message)
             if len(commands) >= 2:
                 break
 
-    listener_task = asyncio.create_task(_listener())
+    async def _handle_command_message(message: StreamMessage) -> None:
+        payload = message.payload if isinstance(message.payload, dict) else None
+        if payload is None:
+            logger.warning("Ignoring malformed execution command payload: %s", message.payload)
+            await message.ack()
+            return
+        commands.append(payload)
+        logger.info(
+            "Captured execution command: target=%s trade_id=%s action=%s",
+            payload.get("target_bot"),
+            payload.get("trade_id"),
+            payload.get("action"),
+        )
+        await message.ack()
+
+    streams = [
+        (f"{redis_manager.channels.execution_commands}:destination", "simulate-destination"),
+        (f"{redis_manager.channels.execution_commands}:source", "simulate-source"),
+    ]
+
+    listener_tasks = [
+        asyncio.create_task(_consume(stream, group, f"{group}-{int(time.time())}"))
+        for stream, group in streams
+    ]
+
     try:
-        await asyncio.wait_for(listener_task, timeout=trade_id_timeout)
+        await asyncio.wait_for(asyncio.gather(*listener_tasks), timeout=trade_id_timeout)
     except asyncio.TimeoutError:
         logger.warning("Timed out waiting for execution commands")
     finally:
-        listener_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await listener_task
+        for task in listener_tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     return commands
 
@@ -127,7 +138,7 @@ async def simulate() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     settings = get_settings()
-    DatabaseManager(settings.database.path).initialize_schema()
+    DatabaseManager(settings.database.url).initialize_schema()
 
     redis_manager = RedisManager(
         settings.redis.url,

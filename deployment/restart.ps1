@@ -10,6 +10,6 @@ if (-not $RemotePath) { throw "Set TALATG_DEPLOY_PATH or pass -RemotePath." }
 
 if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) { throw "ssh not found in PATH." }
 
-$remoteCommand = "cd $RemotePath/deployment && docker compose restart arbitrage-bot"
+$remoteCommand = "cd $RemotePath/deployment && docker compose restart engine agent-source agent-destination admin-bot"
 & ssh "$User@$Host" $remoteCommand
 

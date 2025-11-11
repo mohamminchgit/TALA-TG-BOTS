@@ -1,25 +1,24 @@
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Optional
 
 
-def _load_env_file(env_path: Path) -> None:
-    """Populate os.environ with key/value pairs from a .env file if present."""
-    if not env_path.exists():
+def _load_env_file(env_path: str) -> None:
+    if not os.path.exists(env_path):
         return
 
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+    with open(env_path, "r", encoding="utf-8") as env_file:
+        for line in env_file:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
 
 
 _BOOL_TRUE = {"1", "true", "t", "yes", "y", "on"}
@@ -50,7 +49,7 @@ class TelegramCredentials:
 @dataclass(frozen=True)
 class BotConfig:
     alias: str
-    session_path: Path
+    session_key: str
     group_id: str
     phone_number: Optional[str]
     phone_password: Optional[str]
@@ -71,7 +70,7 @@ class RedisConfig:
 
 @dataclass(frozen=True)
 class DatabaseConfig:
-    path: Path
+    url: str
 
 
 @dataclass(frozen=True)
@@ -95,6 +94,14 @@ class EngineConfig:
 
 
 @dataclass(frozen=True)
+class AdminBotConfig:
+    enabled: bool
+    bot_token: Optional[str]
+    chat_id: Optional[int]
+    status_refresh_seconds: int
+
+
+@dataclass(frozen=True)
 class Settings:
     telegram: TelegramCredentials
     source_bot: BotConfig
@@ -103,15 +110,7 @@ class Settings:
     database: DatabaseConfig
     log_level: str
     engine: EngineConfig
-    admin_bot: "AdminBotConfig"
-
-
-@dataclass(frozen=True)
-class AdminBotConfig:
-    enabled: bool
-    bot_token: Optional[str]
-    chat_id: Optional[int]
-    status_refresh_seconds: int
+    admin_bot: AdminBotConfig
 
 
 def _require_env(name: str) -> str:
@@ -121,16 +120,10 @@ def _require_env(name: str) -> str:
     return value.strip()
 
 
-def _ensure_parent(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 @lru_cache(maxsize=1)
-def get_settings(env_path: Optional[Path] = None) -> Settings:
-    """Return cached application settings loaded from environment variables."""
+def get_settings(env_path: Optional[str] = None) -> Settings:
     if env_path is None:
-        env_path = Path(".env")
+        env_path = ".env"
     _load_env_file(env_path)
 
     telegram = TelegramCredentials(
@@ -138,15 +131,13 @@ def get_settings(env_path: Optional[Path] = None) -> Settings:
         api_hash=_require_env("TELEGRAM_API_HASH"),
     )
 
-    database_path = Path(os.getenv("DATABASE_PATH", "data/database.db")).resolve()
-    _ensure_parent(database_path)
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/talatg")
 
     auto_n_delay_seconds = max(0, _int_env("AUTO_N_DELAY_SECONDS", 3))
 
     def build_bot(prefix: str) -> BotConfig:
         alias = _require_env(f"{prefix}_ALIAS")
-        session_path = Path(os.getenv(f"{prefix}_SESSION_FILE", f"sessions/{prefix.lower()}_bot.session")).resolve()
-        _ensure_parent(session_path)
+        session_key = os.getenv(f"{prefix}_SESSION_KEY", f"{prefix.lower()}_session")
         group_id = _require_env(f"{prefix}_GROUP")
         phone_number = os.getenv(f"{prefix}_PHONE_NUMBER")
         phone_password = os.getenv(f"{prefix}_PHONE_PASSWORD")
@@ -154,7 +145,7 @@ def get_settings(env_path: Optional[Path] = None) -> Settings:
         confirmation_timeout_seconds = int(os.getenv(f"{prefix}_CONFIRMATION_TIMEOUT_SECONDS", "15"))
         return BotConfig(
             alias=alias,
-            session_path=session_path,
+            session_key=session_key.strip(),
             group_id=group_id,
             phone_number=phone_number,
             phone_password=phone_password,
@@ -164,7 +155,7 @@ def get_settings(env_path: Optional[Path] = None) -> Settings:
         )
 
     redis = RedisConfig(
-        url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
     )
 
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -220,18 +211,12 @@ def get_settings(env_path: Optional[Path] = None) -> Settings:
     source_bot_config = build_bot("SOURCE")
     destination_bot_config = build_bot("DESTINATION")
 
-    if source_bot_config.session_path.resolve() == destination_bot_config.session_path.resolve():
-        raise RuntimeError(
-            "SOURCE_SESSION_FILE and DESTINATION_SESSION_FILE resolve to the same path. "
-            "Configure distinct session files for each agent to avoid Telethon SQLite locks."
-        )
-
     return Settings(
         telegram=telegram,
         source_bot=source_bot_config,
         destination_bot=destination_bot_config,
         redis=redis,
-        database=DatabaseConfig(path=database_path),
+        database=DatabaseConfig(url=database_url),
         log_level=log_level,
         engine=engine,
         admin_bot=admin_bot,

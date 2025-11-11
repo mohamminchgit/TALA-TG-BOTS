@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional
 
-from telethon.errors import FloodWaitError, MessageIdInvalidError, RPCError
+from telethon.errors import FloodWaitError, RPCError
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,9 @@ class CommandExecutor:
         self._channel = channel
         self._reconnect_delay = reconnect_delay
         self._task: Optional[asyncio.Task] = None
+        self._group_name = f"commands-{agent.name}"
+        self._consumer_name = f"{agent.name}-consumer-{uuid.uuid4().hex}"
+        self._stream = f"{channel}:{agent.name}"
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -49,24 +52,24 @@ class CommandExecutor:
                 await self._task
 
     async def _run(self) -> None:
-        logger.info("%s subscribing to %s", self._agent.alias, self._channel)
+        logger.info("%s consuming stream %s", self._agent.alias, self._stream)
         while True:
             try:
-                async for message in self._redis.subscribe(self._channel):
-                    await self._handle_message(message)
+                async for message in self._redis.consume_stream(
+                    self._stream,
+                    self._group_name,
+                    self._consumer_name,
+                    count=50,
+                ):
+                    await self._handle_message(message.payload)
+                    await message.ack()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - log & keep running
                 logger.exception("Command executor error: %s", exc)
                 await asyncio.sleep(self._reconnect_delay)
 
-    async def _handle_message(self, message: str) -> None:
-        try:
-            payload = json.loads(message)
-        except json.JSONDecodeError:
-            logger.warning("%s received invalid JSON: %s", self._agent.alias, message)
-            return
-
+    async def _handle_message(self, payload: Dict[str, Any]) -> None:
         target = payload.get("target_bot")
         if target and target != self._agent.name:
             logger.debug("%s ignoring command for %s", self._agent.alias, target)
@@ -188,25 +191,18 @@ class CommandExecutor:
                 acknowledgement_error = str(exc)
                 logger.warning("%s failed to send cancellation ack for %s: %s", self._agent.alias, reply_to_id, exc)
         elif not reply_to_id:
-            acknowledgement_error = "reply_target_missing"
-            logger.warning("%s missing reply_to target for cancellation of %s", self._agent.alias, message_id)
-
-        already_missing = False
-        try:
-            await self._agent.client.delete_messages(self._agent.group_entity, [message_id])
-        except MessageIdInvalidError:
-            already_missing = True
-            logger.warning("%s attempted to delete missing message %s", self._agent.alias, message_id)
+                acknowledgement_error = "reply_target_missing"
+                logger.warning("%s missing reply_to target for cancellation of %s", self._agent.alias, message_id)
 
         await self._agent.emit_execution_result(
             status="success",
             context=context,
             details={
-                "deleted_message_id": message_id,
-                "already_deleted": already_missing,
+                "original_message_id": message_id,
                 "reply_to_message_id": reply_to_id,
                 "ack_sent": ack_sent,
                 "ack_error": acknowledgement_error,
+                "delete_attempted": False,
             },
         )
 

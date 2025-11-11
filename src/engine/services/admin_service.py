@@ -4,10 +4,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from src.common.db import DatabaseManager
-from src.common.redis import RedisManager
+from src.common.redis import RedisManager, StreamMessage
 from src.engine.core.engine_state import EngineState
 from src.engine.core.order_book import OrderBook
 from src.engine.core.trade_matcher import ImmediateArbitrageMatcher
@@ -47,6 +48,8 @@ class AdminCommandService:
         self._policy = policy
         self._safe_pause_task: Optional[asyncio.Task] = None
         self._database = database
+        self._group_name = "admin_commands"
+        self._consumer_name = f"admin-service-{uuid.uuid4().hex}"
 
     def register_shutdown_callback(self, callback: Callable[[], Awaitable[None] | None]) -> None:
         self._shutdown_callbacks.append(callback)
@@ -57,21 +60,33 @@ class AdminCommandService:
             self._safe_pause_task.cancel()
 
     async def run(self) -> None:
-        logger.info("Listening for admin commands on %s", self._command_channel)
+        logger.info("Listening on stream %s for admin commands", self._command_channel)
         try:
-            async for message in self._redis.subscribe(self._command_channel):
+            async for message in self._redis.consume_stream(
+                self._command_channel,
+                self._group_name,
+                self._consumer_name,
+                count=100,
+            ):
                 if self._stop_event.is_set():
                     break
-                payload = self._parse_payload(message)
-                if payload is None:
-                    continue
-                await self._handle_command(payload)
+                await self._handle_stream_message(message)
         except asyncio.CancelledError:
             raise
 
+    async def _handle_stream_message(self, message: StreamMessage) -> None:
+        payload = self._parse_payload(message.payload)
+        if payload is None:
+            await message.ack()
+            return
+        await self._handle_command(payload)
+        await message.ack()
+
     @staticmethod
     def _parse_payload(message: Any) -> Optional[Dict[str, Any]]:
-        if isinstance(message, bytes):
+        if isinstance(message, dict):
+            return message
+        if isinstance(message, (bytes, bytearray)):
             message = message.decode("utf-8", errors="ignore")
         if not isinstance(message, str):
             logger.warning("Unsupported admin command payload type: %s", type(message))
@@ -294,19 +309,19 @@ class AdminCommandService:
             return
 
         with self._database.connect() as conn:
-            cursor = conn.cursor()
-            for key, value in entries.items():
-                cursor.execute(
-                    """
-                    INSERT INTO config (parameter_name, parameter_value, description, updated_at)
-                    VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
-                    ON CONFLICT(parameter_name) DO UPDATE SET
-                        parameter_value=excluded.parameter_value,
-                        updated_at=CURRENT_TIMESTAMP
-                    """,
-                    (key, str(value)),
-                )
-            conn.commit()
+            with conn.cursor() as cursor:
+                for key, value in entries.items():
+                    cursor.execute(
+                        """
+                        INSERT INTO config (parameter_name, parameter_value, description, updated_at)
+                        VALUES (%s, %s, NULL, CURRENT_TIMESTAMP)
+                        ON CONFLICT (parameter_name) DO UPDATE SET
+                            parameter_value = EXCLUDED.parameter_value,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (key, str(value)),
+                    )
+                conn.commit()
 
     @staticmethod
     def _coerce_carry_limit(value: Any, *, allow_zero: bool) -> int:
@@ -331,7 +346,8 @@ class AdminCommandService:
         for target in ("source", "destination"):
             payload = dict(command)
             payload["target_bot"] = target
-            await self._redis.publish_json(self._redis.channels.execution_commands, payload)
+            stream = f"{self._redis.channels.execution_commands}:{target}"
+            await self._redis.publish_json(stream, payload, maxlen=1000)
 
     def _current_state_snapshot(self) -> Dict[str, Any]:
         summary = self._order_book.summary()
@@ -349,14 +365,16 @@ class AdminCommandService:
             "predictive_pending": self._predictive.pending_trade_count(),
         }
         with self._database.connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) AS total_trades, COALESCE(SUM(profit), 0) AS total_profit FROM trade_history")
-            row = cursor.fetchone()
-            if row:
-                snapshot["trade_history"] = {
-                    "total_trades": row["total_trades"],
-                    "total_profit": float(row["total_profit"] or 0.0),
-                }
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) AS total_trades, COALESCE(SUM(profit), 0) AS total_profit FROM trade_history"
+                )
+                row = cursor.fetchone()
+                if row:
+                    snapshot["trade_history"] = {
+                        "total_trades": row["total_trades"],
+                        "total_profit": float(row["total_profit"] or 0.0),
+                    }
         return snapshot
 
     def _outstanding_order_count(self) -> int:

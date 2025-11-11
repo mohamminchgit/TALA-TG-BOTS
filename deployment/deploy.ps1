@@ -46,7 +46,16 @@ finally {
 & scp $archivePath "$User@${targetHost}:/tmp/$archiveName"
 
 # دستورات ریموت که شامل اجرای merge-env.sh هم می‌شود
-$remoteCommand = "mkdir -p $RemotePath && tar -xzf /tmp/$archiveName -C $RemotePath --strip-components=1 && cd $RemotePath && bash deployment/merge-env.sh . && cd deployment && docker compose up -d --build && rm /tmp/$archiveName"
+$remoteCommand = @"
+mkdir -p $RemotePath && \
+tar -xzf /tmp/$archiveName -C $RemotePath --strip-components=1 && \
+cd $RemotePath && \
+bash deployment/merge-env.sh . && \
+cd deployment && \
+docker compose pull postgres redis || true && \
+docker compose up -d --build && \
+rm /tmp/$archiveName
+"@
 & ssh "$User@$targetHost" $remoteCommand
 
 Remove-Item $archivePath -Force

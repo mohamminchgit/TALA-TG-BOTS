@@ -4,11 +4,12 @@ import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from typing import Any, Dict, Optional
 
 from telethon import Button, TelegramClient, events
 
-from src.common.redis import RedisManager
+from src.common.redis import RedisManager, StreamMessage
 from src.engine.core.trade_policy import PolicySnapshot
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,8 @@ class AdminControlBot:
             "source": source_alias,
             "destination": destination_alias,
         }
+        self._report_group = "admin_reports"
+        self._report_consumer = f"admin-bot-{uuid.uuid4().hex}"
 
     async def run(self) -> None:
         await self._client.start(bot_token=self._bot_token)
@@ -209,17 +212,31 @@ class AdminControlBot:
 
     async def _consume_reports(self) -> None:
         try:
-            async for message in self._redis.subscribe(self._redis.channels.admin_reports):
-                try:
-                    payload = json.loads(message)
-                except json.JSONDecodeError:
-                    logger.warning("Admin bot received invalid report payload: %s", message)
-                    continue
-                await self._handle_report(payload)
+            async for message in self._redis.consume_stream(
+                self._redis.channels.admin_reports,
+                self._report_group,
+                self._report_consumer,
+                count=100,
+            ):
+                await self._handle_report_message(message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.exception("Admin report listener failed: %s", exc)
+
+    async def _handle_report_message(self, message: StreamMessage) -> None:
+        payload_raw = message.payload
+        if isinstance(payload_raw, dict):
+            payload = payload_raw
+        else:
+            try:
+                payload = json.loads(payload_raw)
+            except Exception:
+                logger.warning("Admin bot received invalid report payload: %s", payload_raw)
+                await message.ack()
+                return
+        await self._handle_report(payload)
+        await message.ack()
 
     async def _handle_report(self, payload: Dict[str, Any]) -> None:
         event = (payload.get("event") or "").lower()

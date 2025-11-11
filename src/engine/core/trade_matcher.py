@@ -246,7 +246,7 @@ class ImmediateArbitrageMatcher:
             )
 
         for payload in destination_payloads:
-            await self._redis.publish_json(self._commands_channel, payload)
+            await self._publish_command(payload)
 
         source_metadata = {
             "matched_with": [entry.message_id for entry, _ in plan],
@@ -274,7 +274,7 @@ class ImmediateArbitrageMatcher:
             "metadata": source_metadata,
         }
 
-        await self._redis.publish_json(self._commands_channel, source_payload)
+        await self._publish_command(source_payload)
 
         logger.info(
             "Published commands for trade %s (direction=%s source_msg=%s legs=%s total_quantity=%s)",
@@ -300,3 +300,8 @@ class ImmediateArbitrageMatcher:
     def update_minimum_spread(self, value: int) -> None:
         snapshot = self._policy.update(fixed_spread_delta=value)
         logger.info("Updated fixed spread delta via legacy API: %s", snapshot.fixed_spread_delta)
+
+    async def _publish_command(self, payload: Dict[str, Any]) -> None:
+        target = payload.get("target_bot") or "broadcast"
+        stream = f"{self._commands_channel}:{target}"
+        await self._redis.publish_json(stream, payload, maxlen=1000)

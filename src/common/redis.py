@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 import redis.asyncio as redis
 
@@ -17,14 +17,28 @@ class RedisChannels:
     admin_reports: str
 
 
+@dataclass
+class StreamMessage:
+    stream: str
+    group: str
+    message_id: str
+    payload: Dict[str, Any]
+    manager: "RedisManager"
+    delete_after_ack: bool
+
+    async def ack(self) -> None:
+        await self.manager.ack(self.stream, self.group, self.message_id, delete=self.delete_after_ack)
+
+
 class RedisManager:
-    """Async Redis helper providing pub/sub and connection pooling."""
+    """Async Redis helper backed by streams and consumer groups."""
 
     def __init__(self, url: str, channels: RedisChannels) -> None:
         self._url = url
         self._channels = channels
         self._pool: Optional[redis.Redis] = None
         self._lock = asyncio.Lock()
+        self._group_cache: set[Tuple[str, str]] = set()
 
     async def _ensure_pool(self) -> redis.Redis:
         async with self._lock:
@@ -32,29 +46,47 @@ class RedisManager:
                 self._pool = redis.from_url(self._url, encoding="utf-8", decode_responses=True)
             return self._pool
 
-    async def publish(self, channel: str, message: str) -> None:
+    async def publish_json(self, stream: str, payload: Dict[str, Any], *, maxlen: Optional[int] = None) -> str:
         pool = await self._ensure_pool()
-        await pool.publish(channel, message)
+        data = json.dumps(payload, ensure_ascii=False)
+        kwargs: Dict[str, Any] = {"fields": {"payload": data}}
+        if maxlen is not None and maxlen > 0:
+            kwargs["maxlen"] = maxlen
+            kwargs["approximate"] = True
+        message_id = await pool.xadd(stream, **kwargs)
+        return message_id
 
-    async def publish_json(self, channel: str, payload: dict) -> None:
-        await self.publish(channel, json.dumps(payload, ensure_ascii=False))
-
-    async def subscribe(self, channel: str) -> AsyncIterator[str]:
+    async def consume_stream(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        *,
+        count: int = 100,
+        block_ms: int = 5000,
+        delete_on_ack: bool = True,
+    ) -> AsyncIterator[StreamMessage]:
         pool = await self._ensure_pool()
-        pubsub = pool.pubsub()
-        await pubsub.subscribe(channel)
-        try:
-            async for item in pubsub.listen():
-                if item is None:
-                    continue
-                if item.get("type") != "message":
-                    continue
-                data = item.get("data")
-                if data is not None:
-                    yield data
-        finally:
-            await pubsub.unsubscribe(channel)
-            await pubsub.close()
+        await self._ensure_group(pool, stream, group)
+        while True:
+            response = await pool.xreadgroup(group, consumer, streams={stream: ">"}, count=count, block=block_ms)
+            if not response:
+                continue
+            for _, entries in response:
+                for message_id, fields in entries:
+                    payload = self._decode_fields(stream, message_id, fields)
+                    if payload is None:
+                        await pool.xack(stream, group, message_id)
+                        if delete_on_ack:
+                            await pool.xdel(stream, message_id)
+                        continue
+                    yield StreamMessage(stream, group, message_id, payload, self, delete_on_ack)
+
+    async def ack(self, stream: str, group: str, message_id: str, *, delete: bool = True) -> None:
+        pool = await self._ensure_pool()
+        await pool.xack(stream, group, message_id)
+        if delete:
+            await pool.xdel(stream, message_id)
 
     async def add_to_set(self, key: str, member: str, ttl_seconds: Optional[int] = None) -> None:
         pool = await self._ensure_pool()
@@ -95,3 +127,24 @@ class RedisManager:
     @property
     def channels(self) -> RedisChannels:
         return self._channels
+
+    async def _ensure_group(self, pool: redis.Redis, stream: str, group: str) -> None:
+        key = (stream, group)
+        if key in self._group_cache:
+            return
+        try:
+            await pool.xgroup_create(stream, group, id="0", mkstream=True)
+        except redis.ResponseError as exc:  # BUSYGROUP means the group already exists
+            if "BUSYGROUP" not in str(exc):
+                raise
+        self._group_cache.add(key)
+
+    @staticmethod
+    def _decode_fields(stream: str, message_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        raw = fields.get("payload")
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"stream": stream, "message_id": message_id, "raw": raw}
