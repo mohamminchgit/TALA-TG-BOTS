@@ -17,18 +17,29 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $archiveName = "tala-bot-$timestamp.tar.gz"
 $archivePath = Join-Path $PSScriptRoot $archiveName
 
+# مسیر فایل .env محلی
+$localEnvFile = Join-Path $root ".env"
+
 Push-Location $root
 try {
+    # آرگومان‌های tar را برای شامل کردن .env با نام جدید آماده می‌کنیم
     $tarArgs = @(
-        "-czf", $archivePath,
+        "czf", $archivePath,
         "--exclude=.git",
-        "--exclude=.env",
         "--exclude=data",
         "--exclude=sessions",
         "--exclude=ssh-mcp",
-        "--exclude=*.tar.gz",
-        "."
+        "--exclude=*.tar.gz"
     )
+
+    # اگر فایل .env محلی وجود داشت، آن را با نام .env.example به آرشیو اضافه کن
+    if (Test-Path $localEnvFile) {
+        $tarArgs += @("--transform", "s|^\.env$|.env.example|", ".env")
+    }
+    
+    # بقیه فایل‌ها را اضافه کن
+    $tarArgs += "."
+    
     & tar @tarArgs
 }
 finally {
@@ -37,7 +48,8 @@ finally {
 
 & scp $archivePath "$User@${targetHost}:/tmp/$archiveName"
 
-$remoteCommand = "mkdir -p $RemotePath && tar -xzf /tmp/$archiveName -C $RemotePath --strip-components=1 && cd $RemotePath/deployment && docker compose up -d --build && rm /tmp/$archiveName"
+# حالا دستور ریموت از merge-env.sh اصلاح شده استفاده می‌کند
+$remoteCommand = "mkdir -p $RemotePath && tar -xzf /tmp/$archiveName -C $RemotePath --strip-components=1 && cd $RemotePath && bash deployment/merge-env.sh . && cd deployment && docker compose up -d --build && rm /tmp/$archiveName"
 & ssh "$User@$targetHost" $remoteCommand
 
 Remove-Item $archivePath -Force
