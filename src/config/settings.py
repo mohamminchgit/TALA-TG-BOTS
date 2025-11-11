@@ -1,16 +1,17 @@
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 
-def _load_env_file(env_path: str) -> None:
-    if not os.path.exists(env_path):
+def _load_env_file(env_path: str | Path) -> None:
+    path = Path(env_path)
+    if not path.exists():
         return
 
-    with open(env_path, "r", encoding="utf-8") as env_file:
-        for line in env_file:
-            stripped = line.strip()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
             if "=" not in stripped:
@@ -123,7 +124,10 @@ def _require_env(name: str) -> str:
 @lru_cache(maxsize=1)
 def get_settings(env_path: Optional[str] = None) -> Settings:
     if env_path is None:
-        env_path = ".env"
+        candidate = Path(".env")
+        if not candidate.exists():
+            candidate = Path(__file__).resolve().parents[2] / ".env"
+        env_path = candidate
     _load_env_file(env_path)
 
     telegram = TelegramCredentials(

@@ -7,6 +7,8 @@ import getpass
 import sys
 from typing import Optional
 
+from pathlib import Path
+
 from telethon import TelegramClient
 from telethon.errors import PhoneCodeInvalidError, PhoneCodeExpiredError, SessionPasswordNeededError
 from telethon.sessions import StringSession
@@ -14,6 +16,8 @@ from telethon.sessions import StringSession
 from src.common.db import DatabaseManager
 from src.common.session_store import SessionStore
 from src.config.settings import get_settings
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 async def interactive_login(
@@ -76,7 +80,7 @@ def resolve_session_key(name_hint: str) -> str:
 
 
 async def main() -> None:
-    settings = get_settings()
+    settings = get_settings(env_path=PROJECT_ROOT / ".env")
     session_key_hint = input(
         "🔑 وارد کن که این جلسه برای کدام ربات است (مثلاً source یا destination): "
     )
